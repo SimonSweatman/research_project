@@ -1,102 +1,79 @@
+#include <Arduino.h>
 #include <Wire.h>
+#include <avr/pgmspace.h>
 #include "PCA9685.h"
+#include "gait_table.h"
 
 ServoDriver servo;
 
+// ----------------------------
+// PCA9685 settings
+// ----------------------------
 const uint8_t PCA9685_ADDR = 0x7F;
 
-// Change these to actual servo channels
-// Example: cilium 1 uses channels 1 and 2, cilium 2 uses 3 and 4
+// ----------------------------
+// Servo / cilium definitions
+// ----------------------------
 struct Joint {
-  uint8_t ch;
-  float trimDeg;   // calibration offset if 90 is not truly upright
-  bool invert;     // true if servo is mounted reversed
+  uint8_t ch;       // PCA9685 channel
+  int8_t trimDeg;   // calibration offset
+  bool invert;      // reverse motion if mounted opposite way
 };
 
 struct Cilium {
   Joint lower;
   Joint upper;
-  float phaseOffset;   // 0.0 for now, later use e.g. 0.1, 0.2 etc.
+  uint16_t phaseOffsetSteps;  // offset into lookup table
 };
 
-Cilium cilia[2] = {
-  { {1, -15.0f, false}, {2, 5.0f, false}, 0.1f },   // Cilium 1
-  { {3, -10.0f, false}, {4, 5.0f, false}, 0.0f }    // Cilium 2
+// Change these channel numbers to match your real wiring
+Cilium cilia[] = {
+  { {1, 0, false}, {2, 0, false}, 0 },   // cilium 1
+  { {3, 0, false}, {4, 0, false}, 0 }    // cilium 2
 };
 
+const uint8_t NUM_CILIA = sizeof(cilia) / sizeof(cilia[0]);
+
+// ----------------------------
 // Motion timing
-const uint32_t CYCLE_MS  = 1800;   // total cycle time
-const uint16_t UPDATE_MS = 20;     // servo update interval
+// ----------------------------
+// One full 360-step cycle duration
+const uint32_t CYCLE_MS = 1800;
+
+// Update interval for sending commands
+const uint16_t UPDATE_MS = 20;
+
+// ----------------------------
+// Runtime state
+// ----------------------------
 uint32_t motionStartTime = 0;
-
-// Motion angles (good safe starting point)
-const float LOWER_BACK      = 75.0f;
-const float LOWER_FORWARD   = 130.0f;
-
-const float UPPER_UPRIGHT   = 90.0f;
-const float UPPER_STRIKE    = 110.0f;
-const float UPPER_FOLDED  = 165.0f;
+uint32_t lastUpdateTime = 0;
 
 // ----------------------------
-// HELPER FUNCTIONS
+// Helpers
 // ----------------------------
-
 float clampf(float x, float lo, float hi) {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
 }
 
-float lerp(float a, float b, float t) {
-  return a + (b - a) * t;
+uint16_t wrapIndex(int32_t idx) {
+  while (idx >= (int32_t)GAIT_TABLE_SIZE) idx -= GAIT_TABLE_SIZE;
+  while (idx < 0) idx += GAIT_TABLE_SIZE;
+  return (uint16_t)idx;
 }
 
-// Smooth easing for nicer motion
-float smoothstep(float t) {
-  t = clampf(t, 0.0f, 1.0f);
-  return t * t * (3.0f - 2.0f * t);
+uint8_t tableLower(uint16_t idx) {
+  return pgm_read_byte(&LOWER_TABLE[idx]);
 }
 
-float wrap01(float x) {
-  while (x >= 1.0f) x -= 1.0f;
-  while (x < 0.0f)  x += 1.0f;
-  return x;
+uint8_t tableUpper(uint16_t idx) {
+  return pgm_read_byte(&UPPER_TABLE[idx]);
 }
 
-void gaitAtPhase(float phase, float &lowerDeg, float &upperDeg) {
-  phase = wrap01(phase);
-
-  // 1) STRIKE: lower moves forward, upper stays mostly upright
-  if (phase < 0.40f) {
-    float u = smoothstep(phase / 0.40f);
-    lowerDeg = lerp(LOWER_BACK, LOWER_FORWARD, u);
-    upperDeg = lerp(UPPER_UPRIGHT, UPPER_STRIKE, u);
-  }
-
-  // 2) WHIP/FOLD: upper quickly snaps to bent position
-  else if (phase < 0.45f) {
-    float u = smoothstep((phase - 0.40f) / 0.10f);
-    lowerDeg = LOWER_FORWARD;
-    upperDeg = lerp(UPPER_STRIKE, UPPER_FOLDED, u);
-  }
-
-  // 3) RECOVERY: lower comes back while upper stays folded
-  else if (phase < 0.85f) {
-    float u = smoothstep((phase - 0.50f) / 0.35f);
-    lowerDeg = lerp(LOWER_FORWARD, LOWER_BACK, u);
-    upperDeg = UPPER_FOLDED;
-  }
-
-  // 4) RESET: upper returns upright ready for next strike
-  else {
-    float u = smoothstep((phase - 0.85f) / 0.15f);
-    lowerDeg = LOWER_BACK;
-    upperDeg = lerp(UPPER_FOLDED, UPPER_UPRIGHT, u);
-  }
-}
-
-void writeJoint(const Joint &j, float mechAngle) {
-  float cmd = mechAngle;
+void writeJoint(const Joint &j, float cmdAngleDeg) {
+  float cmd = cmdAngleDeg;
 
   if (j.invert) {
     cmd = 180.0f - cmd;
@@ -108,58 +85,73 @@ void writeJoint(const Joint &j, float mechAngle) {
   servo.setAngle(j.ch, cmd);
 }
 
-void updateCilium(const Cilium &c, float masterPhase) {
-  float lowerDeg, upperDeg;
-  float localPhase = wrap01(masterPhase + c.phaseOffset);
+void writeCiliumFromTable(const Cilium &c, uint16_t baseIndex) {
+  uint16_t idx = wrapIndex((int32_t)baseIndex + c.phaseOffsetSteps);
 
-  gaitAtPhase(localPhase, lowerDeg, upperDeg);
+  uint8_t lowerCmd = tableLower(idx);
+  uint8_t upperCmd = tableUpper(idx);
 
-  writeJoint(c.lower, lowerDeg);
-  writeJoint(c.upper, upperDeg);
+  writeJoint(c.lower, lowerCmd);
+  writeJoint(c.upper, upperCmd);
 }
 
-void moveJointSmooth(const Joint &j, float startDeg, float endDeg, int steps, int stepDelayMs) {
-  for (int k = 0; k <= steps; k++) {
-    float t = (float)k / steps;
-    float a = startDeg + (endDeg - startDeg) * t;
-    writeJoint(j, a);
+void moveToStartPoseSmooth(uint16_t steps = 30, uint16_t stepDelayMs = 20) {
+  // Start from approximate centre
+  const float START_LOWER = 90.0f;
+  const float START_UPPER = 90.0f;
+
+  // Table index 0 should be the start of your gait
+  const float targetLower = tableLower(0);
+  const float targetUpper = tableUpper(0);
+
+  for (uint16_t k = 0; k <= steps; k++) {
+    float t = (float)k / (float)steps;
+
+    float lowerNow = START_LOWER + (targetLower - START_LOWER) * t;
+    float upperNow = START_UPPER + (targetUpper - START_UPPER) * t;
+
+    for (uint8_t i = 0; i < NUM_CILIA; i++) {
+      writeJoint(cilia[i].lower, lowerNow);
+      writeJoint(cilia[i].upper, upperNow);
+    }
+
     delay(stepDelayMs);
   }
 }
 
 // ----------------------------
-// ARDUINO SETUP / LOOP
+// Arduino setup / loop
 // ----------------------------
-
 void setup() {
   Wire.begin();
   Serial.begin(115200);
 
   servo.init(PCA9685_ADDR);
-  servo.setServoPulseRange(600, 2400, 180);   // keep if your servos like it
+  servo.setServoPulseRange(600, 2400, 180);
 
-  // Move both cilia gently into starting pose
-for (int i = 0; i < 2; i++) {
-  moveJointSmooth(cilia[i].lower, 90.0f, LOWER_BACK, 30, 20);
-  moveJointSmooth(cilia[i].upper, 90.0f, UPPER_UPRIGHT, 30, 20);
-  delay(1000);
-  }
-motionStartTime = millis();
+  // Gentle move into the first table position
+  moveToStartPoseSmooth();
+
+  delay(300);
+
+  motionStartTime = millis();
+  lastUpdateTime = 0;
 }
 
 void loop() {
-  static uint32_t lastUpdate = 0;
   uint32_t now = millis();
 
-  if (now - lastUpdate >= UPDATE_MS) {
-    lastUpdate = now;
+  if (now - lastUpdateTime < UPDATE_MS) {
+    return;
+  }
+  lastUpdateTime = now;
 
-    uint32_t elapsed = now - motionStartTime;
-    float masterPhase = (elapsed % CYCLE_MS) / (float)CYCLE_MS;
+  uint32_t elapsed = now - motionStartTime;
 
-    // Both move simultaneously for now because both phaseOffset = 0
-    for (int i = 0; i < 2; i++) {
-      updateCilium(cilia[i], masterPhase);
-    }
+  // Convert elapsed time into lookup index 0..359
+  uint16_t baseIndex = (uint32_t)(elapsed % CYCLE_MS) * GAIT_TABLE_SIZE / CYCLE_MS;
+
+  for (uint8_t i = 0; i < NUM_CILIA; i++) {
+    writeCiliumFromTable(cilia[i], baseIndex);
   }
 }
