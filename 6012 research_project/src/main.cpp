@@ -9,6 +9,7 @@ ServoDriver servo;
 // ----------------------------
 // PCA9685 settings
 // ----------------------------
+// Use the address that actually works on your board
 const uint8_t PCA9685_ADDR = 0x7F;
 
 // ----------------------------
@@ -23,25 +24,34 @@ struct Joint {
 struct Cilium {
   Joint lower;
   Joint upper;
-  uint16_t phaseOffsetSteps;  // offset into lookup table
 };
 
-// Change these channel numbers to match your real wiring
+// ----------------------------
+// Cilia mapping
+// ----------------------------
+// Edit channel numbers, trims, and invert flags to match your real setup
 Cilium cilia[] = {
-  { {1, 0, false}, {2, 0, false}, 0 },   // cilium 1
-  { {3, 0, false}, {4, 0, false}, 0 }    // cilium 2
+  { {1, -15, false}, {2, 10, false} },  // cilium 1
+  { {3, -10, false}, {4, 10, false} },  // cilium 2
+  { {5, 5, false}, {6, 10, false} },   // cilium 3
+  { {7, 10, false}, {8, 0, false} },   // cilium 4
+  { {9, -10, false}, {10, 10, false} }   // cilium 5
 };
 
 const uint8_t NUM_CILIA = sizeof(cilia) / sizeof(cilia[0]);
 
 // ----------------------------
-// Motion timing
+// Motion settings
 // ----------------------------
-// One full 360-step cycle duration
+// One full gait cycle duration
 const uint32_t CYCLE_MS = 1800;
 
-// Update interval for sending commands
+// Servo update interval
 const uint16_t UPDATE_MS = 20;
+
+// Phase step between neighbouring cilia
+// Since GAIT_TABLE_SIZE = 360, 20 steps = 20 degrees of phase
+const uint16_t PHASE_STEP = 20;
 
 // ----------------------------
 // Runtime state
@@ -85,8 +95,8 @@ void writeJoint(const Joint &j, float cmdAngleDeg) {
   servo.setAngle(j.ch, cmd);
 }
 
-void writeCiliumFromTable(const Cilium &c, uint16_t baseIndex) {
-  uint16_t idx = wrapIndex((int32_t)baseIndex + c.phaseOffsetSteps);
+void writeCiliumFromTable(const Cilium &c, uint16_t baseIndex, uint16_t phaseOffsetSteps) {
+  uint16_t idx = wrapIndex((int32_t)baseIndex + phaseOffsetSteps);
 
   uint8_t lowerCmd = tableLower(idx);
   uint8_t upperCmd = tableUpper(idx);
@@ -96,11 +106,9 @@ void writeCiliumFromTable(const Cilium &c, uint16_t baseIndex) {
 }
 
 void moveToStartPoseSmooth(uint16_t steps = 30, uint16_t stepDelayMs = 20) {
-  // Start from approximate centre
   const float START_LOWER = 90.0f;
   const float START_UPPER = 90.0f;
 
-  // Table index 0 should be the start of your gait
   const float targetLower = tableLower(0);
   const float targetUpper = tableUpper(0);
 
@@ -129,7 +137,7 @@ void setup() {
   servo.init(PCA9685_ADDR);
   servo.setServoPulseRange(600, 2400, 180);
 
-  // Gentle move into the first table position
+  // Smooth move into the phase-0 gait pose
   moveToStartPoseSmooth();
 
   delay(300);
@@ -148,10 +156,12 @@ void loop() {
 
   uint32_t elapsed = now - motionStartTime;
 
-  // Convert elapsed time into lookup index 0..359
+  // Convert elapsed time into lookup index
   uint16_t baseIndex = (uint32_t)(elapsed % CYCLE_MS) * GAIT_TABLE_SIZE / CYCLE_MS;
 
   for (uint8_t i = 0; i < NUM_CILIA; i++) {
-    writeCiliumFromTable(cilia[i], baseIndex);
+    // Reverse wave direction so cilium 1 leads and the wave propagates forward
+    uint16_t phaseOffset = (NUM_CILIA - 1 - i) * PHASE_STEP;
+    writeCiliumFromTable(cilia[i], baseIndex, phaseOffset);
   }
 }
