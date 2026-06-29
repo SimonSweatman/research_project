@@ -43,12 +43,12 @@ L1 = 45.0   # lower cilium segment length
 L2 = 25.0   # upper cilium segment length
 
 # Number of discrete phase samples across one full cycle
-N = 360
+N = 720
 
 # Baseline servo-command angles (deg)
 # These match the earlier "good starting" whip-recovery idea.
-LOWER_BACK      = 80.0
-LOWER_FORWARD   = 105.0
+LOWER_BACK      = 70.0
+LOWER_FORWARD   = 95.0
 
 UPPER_UPRIGHT   = 92.0
 UPPER_STRIKE    = 100.0
