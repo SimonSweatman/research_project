@@ -5,7 +5,7 @@ from pathlib import Path
 # ==========================================================
 # USER SETTINGS
 # ==========================================================
-VIDEO_PATH = r"C:\Users\simon\OneDrive - University of Southampton\Documents\02_Uni\01_Masters\6012 research project\code\camera_calibration\20260618_154111.mp4"
+VIDEO_PATH = r"C:\Users\simon\OneDrive - University of Southampton\Documents\02_Uni\01_Masters\6012 research project\code\camera_calibration\20260713_152205.mp4"
 
 OUTPUT_FOLDER = Path("checkerboard_calibration_outputs")
 OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)

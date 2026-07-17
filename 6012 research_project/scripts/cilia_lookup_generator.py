@@ -48,7 +48,7 @@ N = 720
 # Baseline servo-command angles (deg)
 # These match the earlier "good starting" whip-recovery idea.
 LOWER_BACK      = 70.0
-LOWER_FORWARD   = 95.0
+LOWER_FORWARD   = 110.0
 
 UPPER_UPRIGHT   = 92.0
 UPPER_STRIKE    = 100.0
@@ -104,7 +104,7 @@ def gait_servo_angles(phase: float) -> tuple[float, float]:
         upper = lerp(UPPER_UPRIGHT, UPPER_STRIKE, u)
 
     # 2) Quick whip/fold
-    elif phase < 0.47:
+    elif phase < 0.5:
         u = smoothstep((phase - 0.40) / 0.07)
         lower = LOWER_FORWARD
         upper = lerp(UPPER_STRIKE, UPPER_FOLDED, u)
@@ -234,6 +234,4 @@ header.append(format_array("UPPER_TABLE", upper_table))
 header_path.write_text("\n".join(header), encoding="utf-8")
 
 print(f"Saved: {header_path}")
-print(f"Saved: {OUT_DIR / 'phase_vs_angle.png'}")
 print(f"Saved: {OUT_DIR / 'tip_path_xz.png'}")
-print(f"Saved: {OUT_DIR / 'tip_vs_phase.png'}")

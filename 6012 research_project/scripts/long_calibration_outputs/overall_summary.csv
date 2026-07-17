@@ -1,2 +1,0 @@
-known_radius_mm,global_fitted_radius_px,pixels_per_mm,mm_per_pixel,global_mean_radius_mm,global_std_radius_mm,global_radius_error_mm,global_radius_error_percent,num_complete_revs,mean_rev_radius_mm,std_between_rev_mean_radius_mm,mean_rpm,std_rpm
-22.0,137.83209272436994,6.265095123834997,0.15961449590694785,21.995917184657134,0.42393666609633995,-0.004082815342865587,-0.018558251558479937,10,21.98304847497519,0.04329977153357744,10.068492940915773,0.09401561707952842
