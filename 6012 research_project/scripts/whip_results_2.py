@@ -8,11 +8,11 @@ from pathlib import Path
 # USER SETTINGS
 # ==========================================================
 
-VIDEO_PATH = r"C:\Users\simon\OneDrive - University of Southampton\Documents\02_Uni\01_Masters\6012 research project\code\camera_calibration\20260714_161627.mp4"
+VIDEO_PATH = r"C:\Users\simon\OneDrive - University of Southampton\Documents\02_Uni\01_Masters\6012 research project\code\camera_calibration\20260717_194941.mp4"
 
 CALIBRATION_NPZ = r"C:\Users\simon\OneDrive - University of Southampton\Documents\02_Uni\01_Masters\6012 research project\code\research_project\6012 research_project\scripts\checkerboard_calibration_outputs\camera_calibration.npz"
 
-OUTPUT_FOLDER = Path(r"C:\temp\green_dot_checkerboard_scale")
+OUTPUT_FOLDER = Path(r"C:\temp\whip_results_2")
 OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
 # 10 x 8 squares = 9 x 7 internal corners
@@ -34,6 +34,37 @@ UPPER_GREEN = np.array([85, 255, 255])
 
 MIN_MARKER_AREA = 30
 MAX_MARKER_AREA = 20000
+
+# ==========================================================
+# COMMANDED CILIUM GAIT
+# ==========================================================
+
+# Link lengths [mm]
+L1 = 45.0
+L2 = 25.0
+
+# Arduino gait timing
+CYCLE_MS = 1800
+
+# Number of samples in the commanded lookup table
+GAIT_TABLE_SIZE = 720
+
+# Number of phase bins used to calculate the average measured path
+AVERAGE_PATH_BINS = 180
+
+# Commanded servo angles [deg]
+LOWER_BACK = 70.0
+LOWER_FORWARD = 110.0
+UPPER_UPRIGHT = 92.0
+UPPER_STRIKE = 100.0
+UPPER_FOLDED = 160.0
+
+# These convert logical servo commands to mechanical joint angles.
+# The Arduino trim makes logical 90 deg physically upright, so the
+# lower model offset remains zero. The upper servo command of 90 deg
+# corresponds to zero relative bend between the two links.
+LOWER_CMD_TO_MECH_OFFSET = 0.0
+UPPER_CMD_TO_MECH_OFFSET = -90.0
 
 # ==========================================================
 # LOAD CAMERA CALIBRATION
@@ -495,6 +526,99 @@ def fit_circle(x, z):
     return centre_x, centre_z, radius
 
 
+
+
+# ==========================================================
+# COMMANDED PATH AND AVERAGE MEASURED PATH
+# ==========================================================
+
+def smoothstep_array(t):
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def generate_commanded_gait():
+    """Generate the same rounded angle commands used by the Arduino table."""
+    phase = np.arange(GAIT_TABLE_SIZE, dtype=float) / GAIT_TABLE_SIZE
+
+    lower = np.empty(GAIT_TABLE_SIZE, dtype=float)
+    upper = np.empty(GAIT_TABLE_SIZE, dtype=float)
+
+    strike = phase < 0.40
+    u = smoothstep_array(phase[strike] / 0.40)
+    lower[strike] = LOWER_BACK + (LOWER_FORWARD - LOWER_BACK) * u
+    upper[strike] = UPPER_UPRIGHT + (UPPER_STRIKE - UPPER_UPRIGHT) * u
+
+    whip = (phase >= 0.40) & (phase < 0.47)
+    u = smoothstep_array((phase[whip] - 0.40) / 0.07)
+    lower[whip] = LOWER_FORWARD
+    upper[whip] = UPPER_STRIKE + (UPPER_FOLDED - UPPER_STRIKE) * u
+
+    recovery = (phase >= 0.47) & (phase < 0.85)
+    u = smoothstep_array((phase[recovery] - 0.47) / 0.38)
+    lower[recovery] = LOWER_FORWARD + (LOWER_BACK - LOWER_FORWARD) * u
+    upper[recovery] = UPPER_FOLDED
+
+    reset = phase >= 0.85
+    u = smoothstep_array((phase[reset] - 0.85) / 0.15)
+    lower[reset] = LOWER_BACK
+    upper[reset] = UPPER_FOLDED + (UPPER_UPRIGHT - UPPER_FOLDED) * u
+
+    # Match the uint8_t lookup table generated for the Arduino.
+    lower = np.round(np.clip(lower, 0, 180))
+    upper = np.round(np.clip(upper, 0, 180))
+
+    return phase, lower, upper
+
+
+def commanded_tip_path():
+    """Calculate commanded tip coordinates using the lookup-generator kinematics."""
+    phase, lower_cmd, upper_cmd = generate_commanded_gait()
+
+    lower_mech = lower_cmd + LOWER_CMD_TO_MECH_OFFSET
+    upper_rel_mech = upper_cmd + UPPER_CMD_TO_MECH_OFFSET
+
+    t1 = np.deg2rad(lower_mech)
+    t2 = np.deg2rad(upper_rel_mech)
+
+    x = L1 * np.cos(t1) + L2 * np.cos(t1 + t2)
+    z = L1 * np.sin(t1) + L2 * np.sin(t1 + t2)
+
+    return phase, x, z
+
+
+def average_measured_path_by_phase(data):
+    """Fold repeated cycles together and calculate one median measured path."""
+    cycle_s = CYCLE_MS / 1000.0
+
+    phase = np.mod(data["tracking_time_s"].to_numpy(), cycle_s) / cycle_s
+    phase_bin = np.floor(phase * AVERAGE_PATH_BINS).astype(int)
+    phase_bin = np.clip(phase_bin, 0, AVERAGE_PATH_BINS - 1)
+
+    folded = pd.DataFrame({
+        "phase_bin": phase_bin,
+        "x_mm": data["x_mm"].to_numpy(),
+        "z_mm": data["z_mm"].to_numpy()
+    })
+
+    average = folded.groupby("phase_bin", as_index=False).median()
+
+    # Reindex to all phase bins and interpolate any bins lost through detection gaps.
+    average = average.set_index("phase_bin").reindex(range(AVERAGE_PATH_BINS))
+    average[["x_mm", "z_mm"]] = average[["x_mm", "z_mm"]].interpolate(
+        method="linear", limit_direction="both"
+    )
+    average = average.reset_index()
+    average["phase"] = average["phase_bin"] / AVERAGE_PATH_BINS
+
+    return average
+
+
+def centre_path(x, z):
+    """Remove translation only; orientation and size are deliberately preserved."""
+    return x - np.mean(x), z - np.mean(z)
+
+
 # ==========================================================
 # OPEN VIDEO
 # ==========================================================
@@ -779,6 +903,135 @@ valid.to_csv(
 )
 
 
+
+
+# ==========================================================
+# COMMANDED PATH VS AVERAGE MEASURED PATH
+# ==========================================================
+
+commanded_phase, commanded_x, commanded_z = commanded_tip_path()
+average_measured = average_measured_path_by_phase(valid)
+
+# Align the two paths by translation only. This keeps any real rotation,
+# scaling or shape mismatch visible rather than fitting it away.
+commanded_x_c, commanded_z_c = centre_path(commanded_x, commanded_z)
+measured_x_c, measured_z_c = centre_path(
+    average_measured["x_mm"].to_numpy(),
+    average_measured["z_mm"].to_numpy()
+)
+
+average_measured["x_centred_mm"] = measured_x_c
+average_measured["z_centred_mm"] = measured_z_c
+
+# Spatial nearest-path error. This compares trajectory shape without needing
+# the video to start at exactly phase zero.
+commanded_points = np.column_stack((commanded_x_c, commanded_z_c))
+measured_points = np.column_stack((measured_x_c, measured_z_c))
+
+pairwise_distances = np.linalg.norm(
+    measured_points[:, None, :] - commanded_points[None, :, :],
+    axis=2
+)
+nearest_commanded_distance = np.min(pairwise_distances, axis=1)
+
+average_measured["nearest_commanded_path_error_mm"] = (
+    nearest_commanded_distance
+)
+
+mean_commanded_path_error_mm = float(np.mean(nearest_commanded_distance))
+maximum_commanded_path_error_mm = float(np.max(nearest_commanded_distance))
+
+commanded_span_x_mm = float(np.ptp(commanded_x_c))
+commanded_span_z_mm = float(np.ptp(commanded_z_c))
+measured_span_x_mm = float(np.ptp(measured_x_c))
+measured_span_z_mm = float(np.ptp(measured_z_c))
+
+average_measured_path = OUTPUT_FOLDER / "average_measured_path.csv"
+average_measured.to_csv(average_measured_path, index=False)
+
+commanded_path_data = pd.DataFrame({
+    "phase": commanded_phase,
+    "x_centred_mm": commanded_x_c,
+    "z_centred_mm": commanded_z_c
+})
+commanded_path_csv = OUTPUT_FOLDER / "commanded_tip_path.csv"
+commanded_path_data.to_csv(commanded_path_csv, index=False)
+
+comparison_summary = pd.DataFrame([{
+    "mean_nearest_commanded_path_error_mm": mean_commanded_path_error_mm,
+    "maximum_nearest_commanded_path_error_mm": maximum_commanded_path_error_mm,
+    "commanded_x_span_mm": commanded_span_x_mm,
+    "commanded_z_span_mm": commanded_span_z_mm,
+    "average_measured_x_span_mm": measured_span_x_mm,
+    "average_measured_z_span_mm": measured_span_z_mm,
+    "measured_to_commanded_x_span_ratio": measured_span_x_mm / commanded_span_x_mm,
+    "measured_to_commanded_z_span_ratio": measured_span_z_mm / commanded_span_z_mm
+}])
+comparison_summary_path = OUTPUT_FOLDER / "commanded_vs_measured_summary.csv"
+comparison_summary.to_csv(comparison_summary_path, index=False)
+
+plt.figure(figsize=(7, 7))
+
+# All measured samples show the cycle-to-cycle spread.
+valid_x_c = valid["x_mm"].to_numpy() - valid["x_mm"].mean()
+valid_z_c = valid["z_mm"].to_numpy() - valid["z_mm"].mean()
+plt.scatter(
+    valid_x_c,
+    valid_z_c,
+    s=5,
+    alpha=0.18,
+    label="All measured positions"
+)
+
+# Median phase-folded line shows the typical actual trajectory.
+plt.plot(
+    measured_x_c,
+    measured_z_c,
+    linewidth=2.5,
+    label="Average measured path"
+)
+
+plt.plot(
+    commanded_x_c,
+    commanded_z_c,
+    linestyle="--",
+    linewidth=2.5,
+    label="Commanded tip path"
+)
+
+plt.xlabel("Centred x position [mm]")
+plt.ylabel("Centred z position [mm]")
+plt.title(
+    "Commanded vs measured cilium tip path\n"
+    f"Mean nearest-path difference = {mean_commanded_path_error_mm:.2f} mm"
+)
+plt.axis("equal")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+
+commanded_comparison_plot = (
+    OUTPUT_FOLDER / "commanded_vs_average_measured_path.png"
+)
+plt.savefig(commanded_comparison_plot, dpi=300)
+
+print("\n--- Commanded vs measured path ---")
+print(
+    f"Mean nearest-path difference: {mean_commanded_path_error_mm:.3f} mm"
+)
+print(
+    f"Maximum nearest-path difference: {maximum_commanded_path_error_mm:.3f} mm"
+)
+print(
+    f"Commanded span: x={commanded_span_x_mm:.3f} mm, "
+    f"z={commanded_span_z_mm:.3f} mm"
+)
+print(
+    f"Average measured span: x={measured_span_x_mm:.3f} mm, "
+    f"z={measured_span_z_mm:.3f} mm"
+)
+
+
 # ==========================================================
 # SAVE SUMMARY
 # ==========================================================
@@ -887,16 +1140,16 @@ plt.scatter(
 plt.xlabel("x position [mm]")
 plt.ylabel("z position [mm]")
 
+plt.title(
+    "Measured marker path vs best-fit circle\n"
+    f"Radius = {circle_radius_mm:.2f} mm, "
+    f"mean error = {mean_absolute_error_mm:.2f} mm "
+    f"({mean_error_percent:.2f}%)"
+)
+
 plt.axis("equal")
 plt.grid(True)
-ax = plt.gca()
-
-ax.legend(
-    loc="center",
-    bbox_to_anchor=(0, 10),
-    bbox_transform=ax.transData,
-    framealpha=0.9
-)
+plt.legend()
 plt.tight_layout()
 
 circle_plot_path = (
@@ -959,4 +1212,8 @@ print(f"Processed tracking data: {processed_data_path}")
 print(f"Tracking summary: {summary_path}")
 print(f"Circle comparison plot: {circle_plot_path}")
 print(f"Radial error plot: {error_plot_path}")
+print(f"Commanded path CSV: {commanded_path_csv}")
+print(f"Average measured path CSV: {average_measured_path}")
+print(f"Commanded comparison summary: {comparison_summary_path}")
+print(f"Commanded comparison plot: {commanded_comparison_plot}")
 print(f"\nAll outputs saved to:\n{OUTPUT_FOLDER.resolve()}")

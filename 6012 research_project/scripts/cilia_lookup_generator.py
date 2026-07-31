@@ -50,8 +50,8 @@ N = 720
 LOWER_BACK      = 70.0
 LOWER_FORWARD   = 110.0
 
-UPPER_UPRIGHT   = 92.0
-UPPER_STRIKE    = 100.0
+UPPER_UPRIGHT   = 110.0
+UPPER_STRIKE    = 70.0
 UPPER_FOLDED    = 160.0
 
 # Mechanical calibration offsets used ONLY for kinematics.

@@ -11,29 +11,51 @@ ServoDriver servo;
 // ============================================================
 
 constexpr uint8_t PCA_ADDR = 0x7E;
+constexpr uint16_t PWM_FREQUENCY_HZ = 50;
 
 // Active cilium
 constexpr uint8_t ACTIVE_LOWER_CH = 11;
 constexpr uint8_t ACTIVE_UPPER_CH = 12;
 
-// Active-cilium trim offsets
-constexpr int8_t ACTIVE_LOWER_TRIM_DEG = -5;
-constexpr int8_t ACTIVE_UPPER_TRIM_DEG = 0;
+// Trims are now PWM counts, not degrees
+constexpr int16_t ACTIVE_LOWER_TRIM_COUNTS = 0;
+constexpr int16_t ACTIVE_UPPER_TRIM_COUNTS = 0;
 
 // Single neighbouring servos
-constexpr uint8_t NEIGHBOUR_70_CH = 5;
-constexpr uint8_t NEIGHBOUR_110_CH = 7;
+constexpr uint8_t NEIGHBOUR_A_CH = 9;
+constexpr uint8_t NEIGHBOUR_B_CH = 7;
 
-// Individual neighbour trims
-constexpr int8_t NEIGHBOUR_70_TRIM_DEG = 0;
-constexpr int8_t NEIGHBOUR_110_TRIM_DEG = 0;
+constexpr int16_t NEIGHBOUR_A_TRIM_COUNTS = 0;
+constexpr int16_t NEIGHBOUR_B_TRIM_COUNTS = 0;
 
 // ============================================================
-// FIXED NEIGHBOUR POSITIONS
+// PWM CONVERSION AND SAFE RANGE
+//
+// These values deliberately reproduce the installed Seeed library's
+// effective setAngle() conversion after its default
+// setServoPulseRange(500, 2500, 180) call:
+//
+//     0 degrees   -> 122 counts
+//     90 degrees  -> 302 counts
+//     180 degrees -> 482 counts
+//
+// The library performs integer division internally, giving 2 counts/degree.
+// Raw-PWM gait tables can use individual counts between these limits.
 // ============================================================
 
-constexpr uint8_t NEIGHBOUR_70_ANGLE_DEG = 90;
-constexpr uint8_t NEIGHBOUR_110_ANGLE_DEG = 120;
+constexpr uint16_t SERVO_ZERO_DEG_PWM = 122;
+constexpr uint16_t SERVO_COUNTS_PER_DEG = 2;
+constexpr uint16_t MIN_SERVO_PWM = 122;
+constexpr uint16_t MAX_SERVO_PWM = 482;
+
+// Empirically selected fixed neighbour positions. Under the conversion above,
+// 284 counts is approximately 81 degrees and 330 is approximately 104 degrees.
+constexpr uint16_t NEIGHBOUR_A_PWM = 284;
+constexpr uint16_t NEIGHBOUR_B_PWM = 330;
+
+// Both active joints start from the exact setAngle(90) equivalent.
+constexpr uint16_t START_LOWER_PWM = 302;
+constexpr uint16_t START_UPPER_PWM = 302;
 
 // ============================================================
 // GAIT TIMING
@@ -50,18 +72,74 @@ constexpr uint32_t STARTUP_RAMP_MS = 1500;
 uint32_t gaitStartTime = 0;
 uint32_t lastUpdateTime = 0;
 
+static_assert(GAIT_TABLE_SIZE >= 2, "The gait table needs at least two entries.");
+static_assert(
+    sizeof(LOWER_TABLE) / sizeof(LOWER_TABLE[0]) == GAIT_TABLE_SIZE,
+    "LOWER_TABLE length does not match GAIT_TABLE_SIZE."
+);
+static_assert(
+    sizeof(UPPER_TABLE) / sizeof(UPPER_TABLE[0]) == GAIT_TABLE_SIZE,
+    "UPPER_TABLE length does not match GAIT_TABLE_SIZE."
+);
+
 // ============================================================
-// APPLY TRIM
+// READ EITHER SUPPORTED GAIT-TABLE FORMAT
 // ============================================================
 
-uint8_t applyTrim(float angleDeg, int8_t trimDeg)
+uint16_t degreeCommandToPwm(uint8_t angleDegrees)
 {
-    const int16_t trimmedAngle =
-        static_cast<int16_t>(round(angleDeg))
-        + trimDeg;
+    const uint16_t limitedAngle =
+        min(static_cast<uint16_t>(angleDegrees), 180U);
 
-    return static_cast<uint8_t>(
-        constrain(trimmedAngle, 0, 180)
+    return SERVO_ZERO_DEG_PWM
+        + limitedAngle * SERVO_COUNTS_PER_DEG;
+}
+
+// Compatibility with the earlier uint8_t degree-table exporter.
+uint16_t readGaitPwm(const uint8_t* table, uint16_t index)
+{
+    return degreeCommandToPwm(pgm_read_byte(&table[index]));
+}
+
+// Preferred format: raw uint16_t PCA9685 OFF counts.
+uint16_t readGaitPwm(const uint16_t* table, uint16_t index)
+{
+    return pgm_read_word(&table[index]);
+}
+
+// ============================================================
+// APPLY PWM TRIM
+// ============================================================
+
+uint16_t applyPwmTrim(float pwmCount, int16_t trimCounts)
+{
+    const int32_t trimmedCount =
+        static_cast<int32_t>(round(pwmCount))
+        + trimCounts;
+
+    return static_cast<uint16_t>(
+        constrain(
+            trimmedCount,
+            static_cast<int32_t>(MIN_SERVO_PWM),
+            static_cast<int32_t>(MAX_SERVO_PWM)
+        )
+    );
+}
+
+// ============================================================
+// WRITE A PWM COUNT
+// ============================================================
+
+void setServoPwm(
+    uint8_t channel,
+    float pwmCount,
+    int16_t trimCounts = 0
+)
+{
+    servo.setPwm(
+        channel,
+        0,
+        applyPwmTrim(pwmCount, trimCounts)
     );
 }
 
@@ -71,20 +149,16 @@ uint8_t applyTrim(float angleDeg, int8_t trimDeg)
 
 void setNeighboursOutOfWay()
 {
-    servo.setAngle(
-        NEIGHBOUR_70_CH,
-        applyTrim(
-            NEIGHBOUR_70_ANGLE_DEG,
-            NEIGHBOUR_70_TRIM_DEG
-        )
+    setServoPwm(
+        NEIGHBOUR_A_CH,
+        NEIGHBOUR_A_PWM,
+        NEIGHBOUR_A_TRIM_COUNTS
     );
 
-    servo.setAngle(
-        NEIGHBOUR_110_CH,
-        applyTrim(
-            NEIGHBOUR_110_ANGLE_DEG,
-            NEIGHBOUR_110_TRIM_DEG
-        )
+    setServoPwm(
+        NEIGHBOUR_B_CH,
+        NEIGHBOUR_B_PWM,
+        NEIGHBOUR_B_TRIM_COUNTS
     );
 }
 
@@ -94,14 +168,11 @@ void setNeighboursOutOfWay()
 
 void rampActiveCiliumToStart()
 {
-    const uint8_t targetLower =
-        pgm_read_byte(&LOWER_TABLE[0]);
+    const uint16_t targetLower =
+        readGaitPwm(LOWER_TABLE, 0);
 
-    const uint8_t targetUpper =
-        pgm_read_byte(&UPPER_TABLE[0]);
-
-    const float startLower = 70.0f;
-    const float startUpper = 110.0f;
+    const uint16_t targetUpper =
+        readGaitPwm(UPPER_TABLE, 0);
 
     const uint32_t rampStart = millis();
 
@@ -114,60 +185,51 @@ void rampActiveCiliumToStart()
             static_cast<float>(elapsed)
             / static_cast<float>(STARTUP_RAMP_MS);
 
+        // Smoothstep ramp
         const float smoothFraction =
             fraction
             * fraction
             * (3.0f - 2.0f * fraction);
 
-        const float lowerAngle =
-            startLower
+        const float lowerPwm =
+            static_cast<float>(START_LOWER_PWM)
             + (
                 static_cast<float>(targetLower)
-                - startLower
+                - static_cast<float>(START_LOWER_PWM)
             ) * smoothFraction;
 
-        const float upperAngle =
-            startUpper
+        const float upperPwm =
+            static_cast<float>(START_UPPER_PWM)
             + (
                 static_cast<float>(targetUpper)
-                - startUpper
+                - static_cast<float>(START_UPPER_PWM)
             ) * smoothFraction;
 
-        servo.setAngle(
+        setServoPwm(
             ACTIVE_LOWER_CH,
-            applyTrim(
-                lowerAngle,
-                ACTIVE_LOWER_TRIM_DEG
-            )
+            lowerPwm,
+            ACTIVE_LOWER_TRIM_COUNTS
         );
 
-        servo.setAngle(
+        setServoPwm(
             ACTIVE_UPPER_CH,
-            applyTrim(
-                upperAngle,
-                ACTIVE_UPPER_TRIM_DEG
-            )
+            upperPwm,
+            ACTIVE_UPPER_TRIM_COUNTS
         );
-
-        setNeighboursOutOfWay();
 
         delay(5);
     }
 
-    servo.setAngle(
+    setServoPwm(
         ACTIVE_LOWER_CH,
-        applyTrim(
-            targetLower,
-            ACTIVE_LOWER_TRIM_DEG
-        )
+        targetLower,
+        ACTIVE_LOWER_TRIM_COUNTS
     );
 
-    servo.setAngle(
+    setServoPwm(
         ACTIVE_UPPER_CH,
-        applyTrim(
-            targetUpper,
-            ACTIVE_UPPER_TRIM_DEG
-        )
+        targetUpper,
+        ACTIVE_UPPER_TRIM_COUNTS
     );
 }
 
@@ -182,7 +244,10 @@ void setup()
     Wire.begin();
 
     servo.init(PCA_ADDR);
-    servo.setServoPulseRange(600, 2400, 180);
+
+    // The table PWM counts must have been calculated for 50 Hz.
+    servo.setFrequency(PWM_FREQUENCY_HZ);
+
     delay(500);
 
     setNeighboursOutOfWay();
@@ -194,9 +259,18 @@ void setup()
     gaitStartTime = millis();
     lastUpdateTime = millis();
 
-    Serial.println("Active cilium gait started.");
-    Serial.println("Neighbour channel 10 fixed at 70 degrees.");
-    Serial.println("Neighbour channel 13 fixed at 110 degrees.");
+    Serial.println("Active cilium PWM gait started.");
+    Serial.println("Neighbour channel 9 fixed at 284 PWM counts.");
+    Serial.println("Neighbour channel 7 fixed at 330 PWM counts.");
+
+    if (sizeof(LOWER_TABLE[0]) == sizeof(uint16_t))
+    {
+        Serial.println("Gait input: uint16_t raw-PWM table (preferred).");
+    }
+    else
+    {
+        Serial.println("Gait input: legacy uint8_t degree table converted to PWM.");
+    }
 }
 
 // ============================================================
@@ -214,15 +288,11 @@ void loop()
 
     lastUpdateTime = currentTime;
 
-    setNeighboursOutOfWay();
-
     const uint32_t elapsedTime =
         currentTime - gaitStartTime;
 
     const float phase =
-        static_cast<float>(
-            elapsedTime % CYCLE_MS
-        )
+        static_cast<float>(elapsedTime % CYCLE_MS)
         / static_cast<float>(CYCLE_MS);
 
     const float tablePosition =
@@ -240,45 +310,43 @@ void loop()
         tablePosition
         - static_cast<float>(index0);
 
-    const uint8_t lower0 =
-        pgm_read_byte(&LOWER_TABLE[index0]);
+    // Read raw PWM values, or safely convert a legacy degree table.
+    const uint16_t lower0 =
+        readGaitPwm(LOWER_TABLE, index0);
 
-    const uint8_t lower1 =
-        pgm_read_byte(&LOWER_TABLE[index1]);
+    const uint16_t lower1 =
+        readGaitPwm(LOWER_TABLE, index1);
 
-    const uint8_t upper0 =
-        pgm_read_byte(&UPPER_TABLE[index0]);
+    const uint16_t upper0 =
+        readGaitPwm(UPPER_TABLE, index0);
 
-    const uint8_t upper1 =
-        pgm_read_byte(&UPPER_TABLE[index1]);
+    const uint16_t upper1 =
+        readGaitPwm(UPPER_TABLE, index1);
 
-    const float lowerAngle =
+    // Interpolate directly between PWM counts
+    const float lowerPwm =
         static_cast<float>(lower0)
         + (
             static_cast<float>(lower1)
             - static_cast<float>(lower0)
         ) * interpolationFraction;
 
-    const float upperAngle =
+    const float upperPwm =
         static_cast<float>(upper0)
         + (
             static_cast<float>(upper1)
             - static_cast<float>(upper0)
         ) * interpolationFraction;
 
-    servo.setAngle(
+    setServoPwm(
         ACTIVE_LOWER_CH,
-        applyTrim(
-            lowerAngle,
-            ACTIVE_LOWER_TRIM_DEG
-        )
+        lowerPwm,
+        ACTIVE_LOWER_TRIM_COUNTS
     );
 
-    servo.setAngle(
+    setServoPwm(
         ACTIVE_UPPER_CH,
-        applyTrim(
-            upperAngle,
-            ACTIVE_UPPER_TRIM_DEG
-        )
+        upperPwm,
+        ACTIVE_UPPER_TRIM_COUNTS
     );
 }
