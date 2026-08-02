@@ -12,7 +12,8 @@ The tip can be moved by dragging it on the canvas, by changing its X/Y
 sliders, or by changing the two servo-angle sliders.  Points can be saved
 manually or captured continuously while Record Trace is enabled.  The
 resulting path can be exported as coordinates, joint-angle tables, or an
-Arduino-style header.
+Arduino-style header.  A second view simulates a phased array of up to 12
+cilia and checks the 50 x 7.5 mm paddles for a 2 mm safety clearance.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from __future__ import annotations
 import bisect
 import csv
 import math
+import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +35,7 @@ from tkinter import filedialog, messagebox, ttk
 
 L1_MM = 50.0
 L2_MM = 50.0
+MIN_REACH_MM = math.sqrt(L1_MM * L1_MM + L2_MM * L2_MM)
 
 LOWER_MIN_DEG = 0.0
 LOWER_MAX_DEG = 180.0
@@ -55,8 +59,18 @@ PWM_COUNTS_PER_DEG = 2.0
 PWM_MIN_COUNT = 0
 PWM_MAX_COUNT = 4095
 
-WORLD_MIN_MM = -110.0
-WORLD_MAX_MM = 110.0
+DESIGNER_X_MIN_MM = -110.0
+DESIGNER_X_MAX_MM = 110.0
+DESIGNER_Y_MIN_MM = -5.0
+DESIGNER_Y_MAX_MM = 110.0
+
+PADDLE_WIDTH_MM = 7.5
+COLLISION_MARGIN_MM = 2.0
+DRIVE_HEIGHT_TOLERANCE_MM = 0.75
+ARRAY_MIN_SPACING_MM = 34.0
+ARRAY_MAX_SPACING_MM = 150.0
+ARRAY_MAX_CILIA = 12
+ARRAY_CYCLE_CHECK_SAMPLES = 360
 
 
 @dataclass(frozen=True)
@@ -87,6 +101,107 @@ def forward_kinematics(lower_deg: float, upper_deg: float) -> tuple[float, float
 def elbow_position(lower_deg: float) -> tuple[float, float]:
     q1 = math.radians(lower_deg)
     return L1_MM * math.cos(q1), L1_MM * math.sin(q1)
+
+
+def oriented_rectangle(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    width_mm: float = PADDLE_WIDTH_MM,
+    expansion_mm: float = 0.0,
+) -> list[tuple[float, float]]:
+    """Return four corners for a rectangular paddle and optional envelope."""
+
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length <= 1e-12:
+        return [start, start, start, start]
+
+    ux = dx / length
+    uy = dy / length
+    px = -uy
+    py = ux
+    half_width = width_mm / 2.0 + expansion_mm
+    start_x = start[0] - ux * expansion_mm
+    start_y = start[1] - uy * expansion_mm
+    end_x = end[0] + ux * expansion_mm
+    end_y = end[1] + uy * expansion_mm
+
+    return [
+        (start_x + px * half_width, start_y + py * half_width),
+        (end_x + px * half_width, end_y + py * half_width),
+        (end_x - px * half_width, end_y - py * half_width),
+        (start_x - px * half_width, start_y - py * half_width),
+    ]
+
+
+def _polygon_axes(
+    polygon: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    axes = []
+    for first, second in zip(polygon, polygon[1:] + polygon[:1]):
+        dx = second[0] - first[0]
+        dy = second[1] - first[1]
+        length = math.hypot(dx, dy)
+        if length > 1e-12:
+            axes.append((-dy / length, dx / length))
+    return axes
+
+
+def rectangles_intersect(
+    first: list[tuple[float, float]],
+    second: list[tuple[float, float]],
+) -> bool:
+    """Separating-axis intersection test for two oriented rectangles."""
+
+    for axis_x, axis_y in _polygon_axes(first) + _polygon_axes(second):
+        first_projection = [x * axis_x + y * axis_y for x, y in first]
+        second_projection = [x * axis_x + y * axis_y for x, y in second]
+        if max(first_projection) < min(second_projection) - 1e-9:
+            return False
+        if max(second_projection) < min(first_projection) - 1e-9:
+            return False
+    return True
+
+
+def _point_segment_distance(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    denominator = dx * dx + dy * dy
+    if denominator <= 1e-12:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    fraction = (
+        (point[0] - start[0]) * dx + (point[1] - start[1]) * dy
+    ) / denominator
+    fraction = clamp(fraction, 0.0, 1.0)
+    closest_x = start[0] + fraction * dx
+    closest_y = start[1] + fraction * dy
+    return math.hypot(point[0] - closest_x, point[1] - closest_y)
+
+
+def rectangle_distance(
+    first: list[tuple[float, float]],
+    second: list[tuple[float, float]],
+) -> float:
+    """Minimum edge distance between two oriented rectangles."""
+
+    if rectangles_intersect(first, second):
+        return 0.0
+
+    minimum = float("inf")
+    first_edges = list(zip(first, first[1:] + first[:1]))
+    second_edges = list(zip(second, second[1:] + second[:1]))
+    for point in first:
+        for start, end in second_edges:
+            minimum = min(minimum, _point_segment_distance(point, start, end))
+    for point in second:
+        for start, end in first_edges:
+            minimum = min(minimum, _point_segment_distance(point, start, end))
+    return minimum
 
 
 def inverse_kinematics(
@@ -236,8 +351,8 @@ class CiliaPathDesigner(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Two-Link Cilia Path Designer")
-        self.geometry("1220x780")
-        self.minsize(980, 650)
+        self.geometry("1260x820")
+        self.minsize(1000, 680)
 
         self.lower_deg = 90.0
         self.upper_deg = 90.0
@@ -272,6 +387,38 @@ class CiliaPathDesigner(tk.Tk):
         self.playback_duration_var = tk.DoubleVar(value=5.0)
         self.loop_playback_var = tk.BooleanVar(value=False)
 
+        # Independent view transforms prevent either settings panel from
+        # changing the scale of its drawing canvas.
+        self.designer_zoom = 1.0
+        self.designer_pan_x_mm = 0.0
+        self.designer_pan_y_mm = 0.0
+        self._designer_pan_anchor: tuple[int, int, float, float] | None = None
+
+        # Array simulator state.  The angle path is copied explicitly from the
+        # designer so later edits cannot silently change an active analysis.
+        self.array_angle_path: list[PathPoint] = []
+        self.array_cilia_count_var = tk.IntVar(value=12)
+        self.array_spacing_var = tk.DoubleVar(value=34.0)
+        self.array_phase_shift_var = tk.DoubleVar(value=0.0)
+        self.array_spacing_text = tk.StringVar(value="34.00")
+        self.array_phase_text = tk.StringVar(value="0.00")
+        self.array_duration_var = tk.DoubleVar(value=5.0)
+        self.array_loop_var = tk.BooleanVar(value=True)
+        self.array_show_traces_var = tk.BooleanVar(value=True)
+        self.array_show_envelopes_var = tk.BooleanVar(value=False)
+        self.array_status_var = tk.StringVar(
+            value="Load the current path, then adjust spacing and phase."
+        )
+        self.array_playing = False
+        self.array_after_id: str | None = None
+        self.array_global_phase = 0.0
+        self.array_playback_started_ms = 0
+        self.array_zoom = 1.0
+        self.array_pan_x_mm = 0.0
+        self.array_pan_y_mm = 0.0
+        self._array_pan_anchor: tuple[int, int, float, float] | None = None
+        self.safety_map_running = False
+
         self._build_interface()
         self._update_value_labels()
         self._draw_scene()
@@ -284,7 +431,14 @@ class CiliaPathDesigner(tk.Tk):
     # ------------------------------------------------------------------ UI
 
     def _build_interface(self) -> None:
-        outer = ttk.Frame(self, padding=10)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+        designer_page = ttk.Frame(self.notebook)
+        array_page = ttk.Frame(self.notebook)
+        self.notebook.add(designer_page, text="Path Designer")
+        self.notebook.add(array_page, text="Array Simulator")
+
+        outer = ttk.Frame(designer_page, padding=10)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=0)
@@ -305,6 +459,11 @@ class CiliaPathDesigner(tk.Tk):
         self.canvas.bind("<Configure>", lambda _event: self._draw_scene())
         self.canvas.bind("<Button-1>", self._canvas_move_tip)
         self.canvas.bind("<B1-Motion>", self._canvas_move_tip)
+        self.canvas.bind("<MouseWheel>", self._zoom_designer_view)
+        self.canvas.bind("<ButtonPress-2>", self._start_designer_pan)
+        self.canvas.bind("<B2-Motion>", self._pan_designer_view)
+        self.canvas.bind("<ButtonPress-3>", self._start_designer_pan)
+        self.canvas.bind("<B3-Motion>", self._pan_designer_view)
 
         # Keep the settings column at a fixed width so its contents cannot
         # resize the graph.  Only the inner settings frame scrolls vertically.
@@ -469,6 +628,15 @@ class CiliaPathDesigner(tk.Tk):
             text="Stop",
             command=self.stop_playback,
         ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        ttk.Button(
+            playback_frame,
+            text="Reset zoom and pan",
+            command=self._reset_designer_view,
+        ).pack(fill="x", pady=(6, 0))
+        ttk.Label(
+            playback_frame,
+            text="Mouse wheel: zoom   |   Middle/right-button drag: pan",
+        ).pack(anchor="w", pady=(5, 0))
 
         export_frame = ttk.LabelFrame(sidebar, text="Export", padding=10)
         export_frame.pack(fill="x", pady=(0, 8))
@@ -514,6 +682,228 @@ class CiliaPathDesigner(tk.Tk):
             justify="left",
             anchor="nw",
             height=5,
+            background=self.cget("background"),
+        ).pack(fill="x", anchor="nw")
+
+        self._build_array_interface(array_page)
+
+    def _build_array_interface(self, parent: ttk.Frame) -> None:
+        outer = ttk.Frame(parent, padding=10)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.columnconfigure(1, weight=0)
+        outer.rowconfigure(0, weight=1)
+
+        canvas_frame = ttk.LabelFrame(outer, text="Cilia array side view", padding=5)
+        canvas_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+        self.array_canvas = tk.Canvas(
+            canvas_frame,
+            background="#f7f8fa",
+            highlightthickness=0,
+            cursor="fleur",
+        )
+        self.array_canvas.grid(row=0, column=0, sticky="nsew")
+        self.array_canvas.bind("<Configure>", lambda _event: self._draw_array_scene())
+        self.array_canvas.bind("<MouseWheel>", self._zoom_array_view)
+        self.array_canvas.bind("<ButtonPress-1>", self._start_array_pan)
+        self.array_canvas.bind("<B1-Motion>", self._pan_array_view)
+        self.array_canvas.bind("<ButtonPress-2>", self._start_array_pan)
+        self.array_canvas.bind("<B2-Motion>", self._pan_array_view)
+        self.array_canvas.bind("<ButtonPress-3>", self._start_array_pan)
+        self.array_canvas.bind("<B3-Motion>", self._pan_array_view)
+
+        sidebar_container = ttk.Frame(outer, width=350)
+        sidebar_container.grid(row=0, column=1, sticky="ns")
+        sidebar_container.grid_propagate(False)
+        sidebar_container.rowconfigure(0, weight=1)
+        sidebar_container.columnconfigure(0, weight=1)
+        self.array_sidebar_canvas = tk.Canvas(
+            sidebar_container,
+            width=328,
+            highlightthickness=0,
+            borderwidth=0,
+            background=self.cget("background"),
+        )
+        self.array_sidebar_canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(
+            sidebar_container,
+            orient="vertical",
+            command=self.array_sidebar_canvas.yview,
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.array_sidebar_canvas.configure(yscrollcommand=scrollbar.set)
+        sidebar = ttk.Frame(self.array_sidebar_canvas)
+        self.array_sidebar_window_id = self.array_sidebar_canvas.create_window(
+            (0, 0), window=sidebar, anchor="nw"
+        )
+        sidebar.bind("<Configure>", self._update_array_sidebar_scroll_region)
+        self.array_sidebar_canvas.bind(
+            "<Configure>", self._resize_array_sidebar_contents
+        )
+
+        navigation = ttk.Frame(sidebar)
+        navigation.pack(fill="x", pady=(0, 8))
+        ttk.Button(
+            navigation,
+            text="Back to Path Designer",
+            command=lambda: self.notebook.select(0),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            navigation,
+            text="Use current path",
+            command=self.load_current_path_into_array,
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+
+        count_frame = ttk.LabelFrame(sidebar, text="Number of cilia", padding=10)
+        count_frame.pack(fill="x", pady=(0, 8))
+        count_row = ttk.Frame(count_frame)
+        count_row.pack(fill="x")
+        ttk.Button(count_row, text="Remove", command=self.remove_array_cilium).pack(
+            side="left", fill="x", expand=True, padx=(0, 4)
+        )
+        ttk.Label(
+            count_row,
+            textvariable=self.array_cilia_count_var,
+            width=5,
+            anchor="center",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left")
+        ttk.Button(count_row, text="Add", command=self.add_array_cilium).pack(
+            side="left", fill="x", expand=True, padx=(4, 0)
+        )
+        ttk.Label(count_frame, text="Allowed range: 1 to 12").pack(
+            anchor="w", pady=(5, 0)
+        )
+
+        geometry_frame = ttk.LabelFrame(sidebar, text="Array geometry", padding=10)
+        geometry_frame.pack(fill="x", pady=(0, 8))
+        self._add_slider(
+            geometry_frame,
+            "Pivot spacing",
+            self.array_spacing_var,
+            ARRAY_MIN_SPACING_MM,
+            ARRAY_MAX_SPACING_MM,
+            self.array_spacing_text,
+            self._array_controls_changed,
+            lambda: self._typed_array_value_changed("spacing"),
+            "mm",
+        )
+        self._add_slider(
+            geometry_frame,
+            "Adjacent phase shift",
+            self.array_phase_shift_var,
+            0.0,
+            360.0,
+            self.array_phase_text,
+            self._array_controls_changed,
+            lambda: self._typed_array_value_changed("phase"),
+            "deg",
+        )
+        ttk.Label(
+            geometry_frame,
+            text=(
+                "Spacing is measured between neighbouring lower-pivot centres. "
+                "Phase shifts above 180 degrees reverse the apparent wave direction."
+            ),
+            wraplength=300,
+            justify="left",
+        ).pack(anchor="w")
+
+        display_frame = ttk.LabelFrame(sidebar, text="Display", padding=10)
+        display_frame.pack(fill="x", pady=(0, 8))
+        ttk.Checkbutton(
+            display_frame,
+            text="Show translated tip traces",
+            variable=self.array_show_traces_var,
+            command=self._draw_array_scene,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            display_frame,
+            text="Show 2 mm safety envelopes",
+            variable=self.array_show_envelopes_var,
+            command=self._draw_array_scene,
+        ).pack(anchor="w", pady=(3, 6))
+        ttk.Button(
+            display_frame,
+            text="Reset zoom and pan",
+            command=self._reset_array_view,
+        ).pack(fill="x")
+        ttk.Label(
+            display_frame,
+            text="Mouse wheel: zoom   |   Left, middle or right drag: pan",
+        ).pack(anchor="w", pady=(5, 0))
+        ttk.Label(
+            display_frame,
+            text="Green tip: within 0.75 mm of the path's maximum height",
+            wraplength=300,
+            justify="left",
+        ).pack(anchor="w", pady=(3, 0))
+
+        playback_frame = ttk.LabelFrame(sidebar, text="Array playback", padding=10)
+        playback_frame.pack(fill="x", pady=(0, 8))
+        duration_row = ttk.Frame(playback_frame)
+        duration_row.pack(fill="x", pady=(0, 5))
+        ttk.Label(duration_row, text="Cycle duration (seconds)").pack(side="left")
+        ttk.Spinbox(
+            duration_row,
+            from_=0.5,
+            to=120.0,
+            increment=0.5,
+            width=7,
+            textvariable=self.array_duration_var,
+        ).pack(side="right")
+        ttk.Checkbutton(
+            playback_frame,
+            text="Loop continuously",
+            variable=self.array_loop_var,
+        ).pack(anchor="w", pady=(0, 5))
+        playback_buttons = ttk.Frame(playback_frame)
+        playback_buttons.pack(fill="x")
+        ttk.Button(playback_buttons, text="Play", command=self.play_array).pack(
+            side="left", fill="x", expand=True, padx=(0, 3)
+        )
+        ttk.Button(playback_buttons, text="Pause", command=self.pause_array).pack(
+            side="left", fill="x", expand=True, padx=3
+        )
+        ttk.Button(playback_buttons, text="Stop", command=self.stop_array).pack(
+            side="left", fill="x", expand=True, padx=(3, 0)
+        )
+
+        collision_frame = ttk.LabelFrame(
+            sidebar, text="Collision analysis", padding=10
+        )
+        collision_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            collision_frame,
+            text=(
+                "Paddles are modelled as 50 x 7.5 mm rectangles. A warning is "
+                "raised below 2 mm surface clearance."
+            ),
+            wraplength=300,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+        ttk.Button(
+            collision_frame,
+            text="Check complete cycle (360 positions)",
+            command=self.check_complete_array_cycle,
+        ).pack(fill="x", pady=(0, 5))
+        ttk.Button(
+            collision_frame,
+            text="Generate phase-spacing safety map",
+            command=self.generate_safety_map,
+        ).pack(fill="x")
+
+        status_frame = ttk.LabelFrame(sidebar, text="Array status", padding=8)
+        status_frame.pack(fill="x")
+        tk.Label(
+            status_frame,
+            textvariable=self.array_status_var,
+            wraplength=300,
+            justify="left",
+            anchor="nw",
+            height=7,
             background=self.cget("background"),
         ).pack(fill="x", anchor="nw")
 
@@ -565,6 +955,17 @@ class CiliaPathDesigner(tk.Tk):
             width=event.width,
         )
 
+    def _update_array_sidebar_scroll_region(self, _event: tk.Event) -> None:
+        bounds = self.array_sidebar_canvas.bbox("all")
+        if bounds is not None:
+            self.array_sidebar_canvas.configure(scrollregion=bounds)
+
+    def _resize_array_sidebar_contents(self, event: tk.Event) -> None:
+        self.array_sidebar_canvas.itemconfigure(
+            self.array_sidebar_window_id,
+            width=event.width,
+        )
+
     def _scroll_sidebar_with_mouse(self, event: tk.Event) -> str | None:
         """Scroll only when the pointer is over the settings column."""
 
@@ -576,6 +977,13 @@ class CiliaPathDesigner(tk.Tk):
                     if steps == 0:
                         steps = -1 if event.delta > 0 else 1
                     self.sidebar_canvas.yview_scroll(steps, "units")
+                return "break"
+            if widget is self.array_sidebar_canvas:
+                if event.delta:
+                    steps = -int(event.delta / 120)
+                    if steps == 0:
+                        steps = -1 if event.delta > 0 else 1
+                    self.array_sidebar_canvas.yview_scroll(steps, "units")
                 return "break"
             widget = widget.master
         return None
@@ -693,10 +1101,17 @@ class CiliaPathDesigner(tk.Tk):
     def _canvas_geometry(self) -> tuple[float, float, float]:
         width = max(self.canvas.winfo_width(), 200)
         height = max(self.canvas.winfo_height(), 200)
-        world_span = WORLD_MAX_MM - WORLD_MIN_MM
-        scale = min((width - 50) / world_span, (height - 50) / world_span)
-        origin_x = width / 2.0
-        origin_y = height / 2.0
+        x_span = DESIGNER_X_MAX_MM - DESIGNER_X_MIN_MM
+        y_span = DESIGNER_Y_MAX_MM - DESIGNER_Y_MIN_MM
+        base_scale = min((width - 50) / x_span, (height - 50) / y_span)
+        scale = base_scale * self.designer_zoom
+        centre_x = self.designer_pan_x_mm
+        centre_y = (
+            (DESIGNER_Y_MIN_MM + DESIGNER_Y_MAX_MM) / 2.0
+            + self.designer_pan_y_mm
+        )
+        origin_x = width / 2.0 - centre_x * scale
+        origin_y = height / 2.0 + centre_y * scale
         return scale, origin_x, origin_y
 
     def _world_to_canvas(self, x_mm: float, y_mm: float) -> tuple[float, float]:
@@ -711,6 +1126,39 @@ class CiliaPathDesigner(tk.Tk):
         x_mm, y_mm = self._canvas_to_world(event.x, event.y)
         self._move_tip_to(x_mm, y_mm)
 
+    def _zoom_designer_view(self, event: tk.Event) -> str:
+        before_x, before_y = self._canvas_to_world(event.x, event.y)
+        factor = 1.12 if event.delta > 0 else 1.0 / 1.12
+        self.designer_zoom = clamp(self.designer_zoom * factor, 0.35, 8.0)
+        after_x, after_y = self._canvas_to_world(event.x, event.y)
+        self.designer_pan_x_mm += before_x - after_x
+        self.designer_pan_y_mm += before_y - after_y
+        self._draw_scene()
+        return "break"
+
+    def _start_designer_pan(self, event: tk.Event) -> None:
+        self._designer_pan_anchor = (
+            event.x,
+            event.y,
+            self.designer_pan_x_mm,
+            self.designer_pan_y_mm,
+        )
+
+    def _pan_designer_view(self, event: tk.Event) -> None:
+        if self._designer_pan_anchor is None:
+            return
+        start_x, start_y, pan_x, pan_y = self._designer_pan_anchor
+        scale, _origin_x, _origin_y = self._canvas_geometry()
+        self.designer_pan_x_mm = pan_x - (event.x - start_x) / scale
+        self.designer_pan_y_mm = pan_y + (event.y - start_y) / scale
+        self._draw_scene()
+
+    def _reset_designer_view(self) -> None:
+        self.designer_zoom = 1.0
+        self.designer_pan_x_mm = 0.0
+        self.designer_pan_y_mm = 0.0
+        self._draw_scene()
+
     def _draw_scene(self) -> None:
         if not hasattr(self, "canvas"):
             return
@@ -718,31 +1166,53 @@ class CiliaPathDesigner(tk.Tk):
 
         # Grid and axes.
         for coordinate in range(-100, 101, 20):
-            x1, y1 = self._world_to_canvas(coordinate, WORLD_MIN_MM)
-            x2, y2 = self._world_to_canvas(coordinate, WORLD_MAX_MM)
+            x1, y1 = self._world_to_canvas(coordinate, DESIGNER_Y_MIN_MM)
+            x2, y2 = self._world_to_canvas(coordinate, DESIGNER_Y_MAX_MM)
             self.canvas.create_line(x1, y1, x2, y2, fill="#e1e5ea")
 
-            x1, y1 = self._world_to_canvas(WORLD_MIN_MM, coordinate)
-            x2, y2 = self._world_to_canvas(WORLD_MAX_MM, coordinate)
+        for coordinate in range(0, 101, 20):
+            x1, y1 = self._world_to_canvas(DESIGNER_X_MIN_MM, coordinate)
+            x2, y2 = self._world_to_canvas(DESIGNER_X_MAX_MM, coordinate)
             self.canvas.create_line(x1, y1, x2, y2, fill="#e1e5ea")
 
-        x1, y1 = self._world_to_canvas(WORLD_MIN_MM, 0.0)
-        x2, y2 = self._world_to_canvas(WORLD_MAX_MM, 0.0)
+        x1, y1 = self._world_to_canvas(DESIGNER_X_MIN_MM, 0.0)
+        x2, y2 = self._world_to_canvas(DESIGNER_X_MAX_MM, 0.0)
         self.canvas.create_line(x1, y1, x2, y2, fill="#68727d", width=2)
-        x1, y1 = self._world_to_canvas(0.0, WORLD_MIN_MM)
-        x2, y2 = self._world_to_canvas(0.0, WORLD_MAX_MM)
+        x1, y1 = self._world_to_canvas(0.0, DESIGNER_Y_MIN_MM)
+        x2, y2 = self._world_to_canvas(0.0, DESIGNER_Y_MAX_MM)
         self.canvas.create_line(x1, y1, x2, y2, fill="#68727d", width=2)
 
-        # Nominal maximum-reach circle.
+        # Only the useful upper half of the nominal workspace is displayed.
         left, top = self._world_to_canvas(-L1_MM - L2_MM, L1_MM + L2_MM)
         right, bottom = self._world_to_canvas(L1_MM + L2_MM, -L1_MM - L2_MM)
-        self.canvas.create_oval(
+        self.canvas.create_arc(
             left,
             top,
             right,
             bottom,
+            start=0,
+            extent=180,
+            style="arc",
             outline="#aab2bb",
             dash=(5, 4),
+            width=1,
+        )
+        inner_left, inner_top = self._world_to_canvas(
+            -MIN_REACH_MM, MIN_REACH_MM
+        )
+        inner_right, inner_bottom = self._world_to_canvas(
+            MIN_REACH_MM, -MIN_REACH_MM
+        )
+        self.canvas.create_arc(
+            inner_left,
+            inner_top,
+            inner_right,
+            inner_bottom,
+            start=0,
+            extent=180,
+            style="arc",
+            outline="#8e99a4",
+            dash=(2, 4),
             width=1,
         )
 
@@ -781,20 +1251,20 @@ class CiliaPathDesigner(tk.Tk):
         elbow_canvas = self._world_to_canvas(elbow_x_mm, elbow_y_mm)
         tip_canvas = self._world_to_canvas(self.tip_x_mm, self.tip_y_mm)
 
-        self.canvas.create_line(
-            *base_canvas,
-            *elbow_canvas,
-            fill="#37474f",
-            width=12,
-            capstyle="round",
+        lower_rectangle = oriented_rectangle((0.0, 0.0), (elbow_x_mm, elbow_y_mm))
+        upper_rectangle = oriented_rectangle(
+            (elbow_x_mm, elbow_y_mm), (self.tip_x_mm, self.tip_y_mm)
         )
-        self.canvas.create_line(
-            *elbow_canvas,
-            *tip_canvas,
-            fill="#f57c00",
-            width=12,
-            capstyle="round",
-        )
+        for rectangle, colour in (
+            (lower_rectangle, "#37474f"),
+            (upper_rectangle, "#f57c00"),
+        ):
+            coordinates: list[float] = []
+            for world_x, world_y in rectangle:
+                coordinates.extend(self._world_to_canvas(world_x, world_y))
+            self.canvas.create_polygon(
+                *coordinates, fill=colour, outline="#263238", width=1
+            )
 
         for x_canvas, y_canvas, colour, radius in (
             (*base_canvas, "#263238", 8),
@@ -841,6 +1311,902 @@ class CiliaPathDesigner(tk.Tk):
                 fill="#2e7d32",
                 font=("Segoe UI", 11, "bold"),
             )
+
+    # ------------------------------------------------------ Array simulator
+
+    def load_current_path_into_array(self) -> None:
+        self.stop_array(reset_phase=False)
+        if len(self.path_points) < 2:
+            messagebox.showerror(
+                "No path available",
+                "Save or trace at least two path points in the Path Designer first.",
+                parent=self,
+            )
+            return
+        try:
+            self.array_angle_path = resample_polyline(
+                self.path_points, ARRAY_CYCLE_CHECK_SAMPLES
+            )
+        except ValueError as error:
+            messagebox.showerror("Cannot load path", str(error), parent=self)
+            return
+
+        closure_gap = math.hypot(
+            self.array_angle_path[-1].x_mm - self.array_angle_path[0].x_mm,
+            self.array_angle_path[-1].y_mm - self.array_angle_path[0].y_mm,
+        )
+        self.array_global_phase = 0.0
+        self.array_status_var.set(
+            f"Loaded {len(self.array_angle_path)} joint-angle samples. "
+            f"Cycle closure gap: {closure_gap:.2f} mm."
+        )
+        self.notebook.select(1)
+        self._draw_array_scene()
+
+    def add_array_cilium(self) -> None:
+        count = self.array_cilia_count_var.get()
+        if count < ARRAY_MAX_CILIA:
+            self.array_cilia_count_var.set(count + 1)
+            self._draw_array_scene()
+        else:
+            self.array_status_var.set("The simulator is limited to 12 cilia.")
+
+    def remove_array_cilium(self) -> None:
+        count = self.array_cilia_count_var.get()
+        if count > 1:
+            self.array_cilia_count_var.set(count - 1)
+            self._draw_array_scene()
+        else:
+            self.array_status_var.set("At least one cilium must remain.")
+
+    def _array_controls_changed(self, _value: str = "") -> None:
+        if self._updating_controls:
+            return
+        spacing = clamp(
+            self.array_spacing_var.get(),
+            ARRAY_MIN_SPACING_MM,
+            ARRAY_MAX_SPACING_MM,
+        )
+        phase_shift = clamp(self.array_phase_shift_var.get(), 0.0, 360.0)
+        self._updating_controls = True
+        try:
+            self.array_spacing_var.set(spacing)
+            self.array_phase_shift_var.set(phase_shift)
+            self.array_spacing_text.set(f"{spacing:.2f}")
+            self.array_phase_text.set(f"{phase_shift:.2f}")
+        finally:
+            self._updating_controls = False
+        self._draw_array_scene()
+
+    def _typed_array_value_changed(self, control: str) -> None:
+        if self._updating_controls:
+            return
+        variable = (
+            self.array_spacing_text if control == "spacing" else self.array_phase_text
+        )
+        try:
+            value = float(variable.get().strip())
+        except ValueError:
+            self.array_status_var.set("Enter a valid numerical spacing or phase.")
+            self._array_controls_changed()
+            return
+
+        if control == "spacing":
+            if not ARRAY_MIN_SPACING_MM <= value <= ARRAY_MAX_SPACING_MM:
+                self.array_status_var.set("Spacing must be between 34 and 150 mm.")
+                self._array_controls_changed()
+                return
+            self.array_spacing_var.set(value)
+        else:
+            if not 0.0 <= value <= 360.0:
+                self.array_status_var.set("Phase shift must be between 0 and 360 degrees.")
+                self._array_controls_changed()
+                return
+            self.array_phase_shift_var.set(value)
+        self._array_controls_changed()
+
+    def _array_world_bounds(self) -> tuple[float, float, float, float]:
+        count = max(1, self.array_cilia_count_var.get())
+        spacing = self.array_spacing_var.get()
+        array_width = (count - 1) * spacing
+        return (
+            -array_width / 2.0 - 105.0,
+            array_width / 2.0 + 105.0,
+            -5.0,
+            110.0,
+        )
+
+    def _array_canvas_geometry(self) -> tuple[float, float, float]:
+        width = max(self.array_canvas.winfo_width(), 200)
+        height = max(self.array_canvas.winfo_height(), 200)
+        x_min, x_max, y_min, y_max = self._array_world_bounds()
+        base_scale = min(
+            (width - 50) / max(1.0, x_max - x_min),
+            (height - 50) / max(1.0, y_max - y_min),
+        )
+        scale = base_scale * self.array_zoom
+        centre_x = (x_min + x_max) / 2.0 + self.array_pan_x_mm
+        centre_y = (y_min + y_max) / 2.0 + self.array_pan_y_mm
+        origin_x = width / 2.0 - centre_x * scale
+        origin_y = height / 2.0 + centre_y * scale
+        return scale, origin_x, origin_y
+
+    def _array_world_to_canvas(
+        self, x_mm: float, y_mm: float
+    ) -> tuple[float, float]:
+        scale, origin_x, origin_y = self._array_canvas_geometry()
+        return origin_x + x_mm * scale, origin_y - y_mm * scale
+
+    def _array_canvas_to_world(
+        self, canvas_x: float, canvas_y: float
+    ) -> tuple[float, float]:
+        scale, origin_x, origin_y = self._array_canvas_geometry()
+        return (canvas_x - origin_x) / scale, (origin_y - canvas_y) / scale
+
+    def _zoom_array_view(self, event: tk.Event) -> str:
+        before_x, before_y = self._array_canvas_to_world(event.x, event.y)
+        factor = 1.12 if event.delta > 0 else 1.0 / 1.12
+        self.array_zoom = clamp(self.array_zoom * factor, 0.25, 12.0)
+        after_x, after_y = self._array_canvas_to_world(event.x, event.y)
+        self.array_pan_x_mm += before_x - after_x
+        self.array_pan_y_mm += before_y - after_y
+        self._draw_array_scene()
+        return "break"
+
+    def _start_array_pan(self, event: tk.Event) -> None:
+        self._array_pan_anchor = (
+            event.x,
+            event.y,
+            self.array_pan_x_mm,
+            self.array_pan_y_mm,
+        )
+
+    def _pan_array_view(self, event: tk.Event) -> None:
+        if self._array_pan_anchor is None:
+            return
+        start_x, start_y, pan_x, pan_y = self._array_pan_anchor
+        scale, _origin_x, _origin_y = self._array_canvas_geometry()
+        self.array_pan_x_mm = pan_x - (event.x - start_x) / scale
+        self.array_pan_y_mm = pan_y + (event.y - start_y) / scale
+        self._draw_array_scene()
+
+    def _reset_array_view(self) -> None:
+        self.array_zoom = 1.0
+        self.array_pan_x_mm = 0.0
+        self.array_pan_y_mm = 0.0
+        self._draw_array_scene()
+
+    @staticmethod
+    def _path_point_at_phase(path: list[PathPoint], phase: float) -> PathPoint:
+        if not path:
+            return PathPoint(0.0, 100.0, 90.0, 90.0, "array")
+        table_position = (phase % 1.0) * len(path)
+        index0 = int(math.floor(table_position)) % len(path)
+        index1 = (index0 + 1) % len(path)
+        fraction = table_position - math.floor(table_position)
+        lower = path[index0].lower_deg + (
+            path[index1].lower_deg - path[index0].lower_deg
+        ) * fraction
+        upper = path[index0].upper_deg + (
+            path[index1].upper_deg - path[index0].upper_deg
+        ) * fraction
+        x_mm, y_mm = forward_kinematics(lower, upper)
+        return PathPoint(x_mm, y_mm, lower, upper, "array")
+
+    @classmethod
+    def _array_poses(
+        cls,
+        path: list[PathPoint],
+        global_phase: float,
+        count: int,
+        spacing_mm: float,
+        phase_shift_deg: float,
+    ) -> list[dict]:
+        poses = []
+        for index in range(count):
+            base_x = (index - (count - 1) / 2.0) * spacing_mm
+            local_phase = (
+                global_phase + index * phase_shift_deg / 360.0
+            ) % 1.0
+            point = cls._path_point_at_phase(path, local_phase)
+            elbow_x, elbow_y = elbow_position(point.lower_deg)
+            base = (base_x, 0.0)
+            elbow = (base_x + elbow_x, elbow_y)
+            tip = (base_x + point.x_mm, point.y_mm)
+            rectangles = [
+                oriented_rectangle(base, elbow),
+                oriented_rectangle(elbow, tip),
+            ]
+            envelopes = [
+                oriented_rectangle(base, elbow, expansion_mm=COLLISION_MARGIN_MM / 2.0),
+                oriented_rectangle(
+                    elbow, tip, expansion_mm=COLLISION_MARGIN_MM / 2.0
+                ),
+            ]
+            poses.append(
+                {
+                    "index": index,
+                    "phase": local_phase,
+                    "point": point,
+                    "base": base,
+                    "elbow": elbow,
+                    "tip": tip,
+                    "rectangles": rectangles,
+                    "envelopes": envelopes,
+                }
+            )
+        return poses
+
+    @staticmethod
+    def _collision_state(
+        poses: list[dict],
+    ) -> tuple[float, tuple[int, int, int, int] | None, set[tuple[int, int]]]:
+        minimum = float("inf")
+        closest: tuple[int, int, int, int] | None = None
+        colliding_links: set[tuple[int, int]] = set()
+        for first_index in range(len(poses)):
+            for second_index in range(first_index + 1, len(poses)):
+                base_separation = abs(
+                    poses[second_index]["base"][0] - poses[first_index]["base"][0]
+                )
+                if base_separation > 2.0 * (L1_MM + L2_MM) + COLLISION_MARGIN_MM:
+                    continue
+                for first_link, first_rectangle in enumerate(
+                    poses[first_index]["rectangles"]
+                ):
+                    for second_link, second_rectangle in enumerate(
+                        poses[second_index]["rectangles"]
+                    ):
+                        distance = rectangle_distance(first_rectangle, second_rectangle)
+                        if distance < minimum:
+                            minimum = distance
+                            closest = (
+                                first_index,
+                                first_link,
+                                second_index,
+                                second_link,
+                            )
+                        if distance < COLLISION_MARGIN_MM - 1e-9:
+                            colliding_links.add((first_index, first_link))
+                            colliding_links.add((second_index, second_link))
+        return minimum, closest, colliding_links
+
+    @staticmethod
+    def _poses_have_safety_collision(poses: list[dict]) -> bool:
+        """Fast conservative envelope test used by the safety-map scan."""
+
+        for first_index in range(len(poses)):
+            for second_index in range(first_index + 1, len(poses)):
+                if abs(
+                    poses[second_index]["base"][0] - poses[first_index]["base"][0]
+                ) > 2.0 * (L1_MM + L2_MM) + COLLISION_MARGIN_MM:
+                    continue
+                for first_rectangle in poses[first_index]["envelopes"]:
+                    for second_rectangle in poses[second_index]["envelopes"]:
+                        if rectangles_intersect(first_rectangle, second_rectangle):
+                            return True
+        return False
+
+    @classmethod
+    def _sampled_configuration_is_unsafe(
+        cls,
+        path: list[PathPoint],
+        count: int,
+        spacing_mm: float,
+        phase_shift_deg: float,
+        sample_count: int,
+    ) -> bool:
+        """Check unique cilium separations across a sampled full cycle.
+
+        Every pair with the same index separation repeats the same relative
+        motion, only offset in time and X.  Checking one representative pair
+        per separation therefore removes duplicate work from the safety map.
+        The map's five-degree phase grid is aligned to its 72 cycle samples.
+        """
+
+        for index_separation in range(1, count):
+            base_separation = index_separation * spacing_mm
+            if (
+                base_separation
+                > 2.0 * (L1_MM + L2_MM) + COLLISION_MARGIN_MM
+            ):
+                break
+            relative_phase = index_separation * phase_shift_deg / 360.0
+            for sample in range(sample_count):
+                global_phase = sample / sample_count
+                first_point = cls._path_point_at_phase(path, global_phase)
+                second_point = cls._path_point_at_phase(
+                    path, global_phase + relative_phase
+                )
+                first_elbow = elbow_position(first_point.lower_deg)
+                second_elbow_local = elbow_position(second_point.lower_deg)
+                second_base = (base_separation, 0.0)
+                second_elbow = (
+                    base_separation + second_elbow_local[0],
+                    second_elbow_local[1],
+                )
+                first_rectangles = (
+                    oriented_rectangle((0.0, 0.0), first_elbow),
+                    oriented_rectangle(
+                        first_elbow, (first_point.x_mm, first_point.y_mm)
+                    ),
+                )
+                second_rectangles = (
+                    oriented_rectangle(second_base, second_elbow),
+                    oriented_rectangle(
+                        second_elbow,
+                        (
+                            base_separation + second_point.x_mm,
+                            second_point.y_mm,
+                        ),
+                    ),
+                )
+                for first_rectangle in first_rectangles:
+                    for second_rectangle in second_rectangles:
+                        if (
+                            rectangle_distance(first_rectangle, second_rectangle)
+                            < COLLISION_MARGIN_MM - 1e-9
+                        ):
+                            return True
+        return False
+
+    def _draw_array_polygon(
+        self,
+        polygon: list[tuple[float, float]],
+        **options,
+    ) -> int:
+        coordinates: list[float] = []
+        for world_x, world_y in polygon:
+            coordinates.extend(self._array_world_to_canvas(world_x, world_y))
+        return self.array_canvas.create_polygon(*coordinates, **options)
+
+    def _draw_array_scene(self) -> None:
+        if not hasattr(self, "array_canvas"):
+            return
+        self.array_canvas.delete("all")
+        count = self.array_cilia_count_var.get()
+        spacing = self.array_spacing_var.get()
+        phase_shift = self.array_phase_shift_var.get()
+        path = self.array_angle_path
+
+        x_min, x_max, y_min, y_max = self._array_world_bounds()
+        grid_step = 20 if x_max - x_min < 700 else 50
+        first_grid_x = math.floor(x_min / grid_step) * grid_step
+        x_value = first_grid_x
+        while x_value <= x_max:
+            start = self._array_world_to_canvas(x_value, y_min)
+            end = self._array_world_to_canvas(x_value, y_max)
+            self.array_canvas.create_line(*start, *end, fill="#e1e5ea")
+            x_value += grid_step
+        for y_value in range(0, 101, 20):
+            start = self._array_world_to_canvas(x_min, y_value)
+            end = self._array_world_to_canvas(x_max, y_value)
+            self.array_canvas.create_line(*start, *end, fill="#e1e5ea")
+        start = self._array_world_to_canvas(x_min, 0.0)
+        end = self._array_world_to_canvas(x_max, 0.0)
+        self.array_canvas.create_line(*start, *end, fill="#68727d", width=2)
+
+        if not path:
+            self.array_canvas.create_text(
+                self.array_canvas.winfo_width() / 2,
+                self.array_canvas.winfo_height() / 2,
+                text="Load a recorded path from the Path Designer",
+                fill="#58636f",
+                font=("Segoe UI", 14, "bold"),
+            )
+            return
+
+        poses = self._array_poses(
+            path, self.array_global_phase, count, spacing, phase_shift
+        )
+        maximum_tip_height = max(point.y_mm for point in path)
+        minimum, closest, colliding_links = self._collision_state(poses)
+
+        for pose in poses:
+            base_x = pose["base"][0]
+            left, top = self._array_world_to_canvas(base_x - 100.0, 100.0)
+            right, bottom = self._array_world_to_canvas(base_x + 100.0, -100.0)
+            self.array_canvas.create_arc(
+                left,
+                top,
+                right,
+                bottom,
+                start=0,
+                extent=180,
+                style="arc",
+                outline="#c6ccd2",
+                dash=(4, 5),
+            )
+            inner_left, inner_top = self._array_world_to_canvas(
+                base_x - MIN_REACH_MM, MIN_REACH_MM
+            )
+            inner_right, inner_bottom = self._array_world_to_canvas(
+                base_x + MIN_REACH_MM, -MIN_REACH_MM
+            )
+            self.array_canvas.create_arc(
+                inner_left,
+                inner_top,
+                inner_right,
+                inner_bottom,
+                start=0,
+                extent=180,
+                style="arc",
+                outline="#a8b0b8",
+                dash=(2, 4),
+            )
+
+            if self.array_show_traces_var.get():
+                trace_coordinates: list[float] = []
+                for point in path:
+                    trace_coordinates.extend(
+                        self._array_world_to_canvas(
+                            base_x + point.x_mm, point.y_mm
+                        )
+                    )
+                if len(trace_coordinates) >= 4:
+                    self.array_canvas.create_line(
+                        *trace_coordinates,
+                        fill="#90caf9",
+                        width=1,
+                        joinstyle="round",
+                    )
+
+            if self.array_show_envelopes_var.get():
+                for envelope in pose["envelopes"]:
+                    coordinates: list[float] = []
+                    for world_x, world_y in envelope:
+                        coordinates.extend(
+                            self._array_world_to_canvas(world_x, world_y)
+                        )
+                    self.array_canvas.create_polygon(
+                        *coordinates,
+                        fill="",
+                        outline="#ffb74d",
+                        dash=(3, 3),
+                    )
+
+        for pose in poses:
+            for link_index, rectangle in enumerate(pose["rectangles"]):
+                collision = (pose["index"], link_index) in colliding_links
+                colour = (
+                    "#d32f2f"
+                    if collision
+                    else ("#455a64" if link_index == 0 else "#f57c00")
+                )
+                self._draw_array_polygon(
+                    rectangle,
+                    fill=colour,
+                    outline="#263238",
+                    width=1,
+                )
+            tip_is_driving = (
+                pose["tip"][1]
+                >= maximum_tip_height - DRIVE_HEIGHT_TOLERANCE_MM
+            )
+            for point, radius, colour in (
+                (pose["base"], 5, "#263238"),
+                (pose["elbow"], 4, "#263238"),
+                (pose["tip"], 5 if tip_is_driving else 4,
+                 "#2e7d32" if tip_is_driving else "#c62828"),
+            ):
+                canvas_x, canvas_y = self._array_world_to_canvas(*point)
+                self.array_canvas.create_oval(
+                    canvas_x - radius,
+                    canvas_y - radius,
+                    canvas_x + radius,
+                    canvas_y + radius,
+                    fill=colour,
+                    outline="white",
+                )
+            base_canvas = self._array_world_to_canvas(*pose["base"])
+            self.array_canvas.create_text(
+                base_canvas[0],
+                base_canvas[1] + 14,
+                text=str(pose["index"] + 1),
+                anchor="n",
+                fill="#37474f",
+                font=("Segoe UI", 8),
+            )
+
+        if self.array_playing:
+            clearance_text = (
+                "n/a" if math.isinf(minimum) else f"{minimum:.2f} mm"
+            )
+            warning = "  COLLISION WARNING" if colliding_links else ""
+            self.array_status_var.set(
+                f"Playing phase {self.array_global_phase * 360.0:.1f} deg. "
+                f"Current minimum clearance: {clearance_text}.{warning}"
+            )
+        if colliding_links:
+            self.array_canvas.create_text(
+                16,
+                16,
+                text="CLEARANCE BELOW 2 mm",
+                anchor="nw",
+                fill="#c62828",
+                font=("Segoe UI", 11, "bold"),
+            )
+
+    def play_array(self) -> None:
+        if not self.array_angle_path:
+            messagebox.showerror(
+                "No array path",
+                "Use the current Path Designer trace before starting playback.",
+                parent=self,
+            )
+            return
+        try:
+            duration = float(self.array_duration_var.get())
+        except (ValueError, tk.TclError):
+            duration = 0.0
+        if duration <= 0.0:
+            messagebox.showerror(
+                "Invalid duration",
+                "Cycle duration must be greater than zero.",
+                parent=self,
+            )
+            return
+        self.pause_array(silent=True)
+        self.array_playing = True
+        self.array_playback_started_ms = (
+            time.perf_counter() * 1000.0
+            - self.array_global_phase * duration * 1000.0
+        )
+        self._array_next_frame()
+
+    def _array_next_frame(self) -> None:
+        self.array_after_id = None
+        if not self.array_playing:
+            return
+        duration = max(0.001, float(self.array_duration_var.get()))
+        elapsed = (time.perf_counter() * 1000.0 - self.array_playback_started_ms) / 1000.0
+        if elapsed >= duration and not self.array_loop_var.get():
+            self.array_global_phase = 1.0 - 1e-9
+            self.array_playing = False
+            self._draw_array_scene()
+            self.array_status_var.set("Array playback complete.")
+            return
+        self.array_global_phase = (elapsed / duration) % 1.0
+        self._draw_array_scene()
+        self.array_after_id = self.after(33, self._array_next_frame)
+
+    def pause_array(self, silent: bool = False) -> None:
+        was_playing = self.array_playing
+        self.array_playing = False
+        if self.array_after_id is not None:
+            try:
+                self.after_cancel(self.array_after_id)
+            except tk.TclError:
+                pass
+            self.array_after_id = None
+        if was_playing and not silent:
+            self.array_status_var.set(
+                f"Array paused at phase {self.array_global_phase * 360.0:.1f} degrees."
+            )
+
+    def stop_array(self, reset_phase: bool = True) -> None:
+        self.pause_array(silent=True)
+        if reset_phase:
+            self.array_global_phase = 0.0
+        self._draw_array_scene()
+        self.array_status_var.set("Array playback stopped.")
+
+    def check_complete_array_cycle(self) -> None:
+        if not self.array_angle_path:
+            messagebox.showerror(
+                "No array path",
+                "Load the current path before checking the cycle.",
+                parent=self,
+            )
+            return
+        self.pause_array(silent=True)
+        count = self.array_cilia_count_var.get()
+        spacing = self.array_spacing_var.get()
+        phase_shift = self.array_phase_shift_var.get()
+        minimum = float("inf")
+        worst_phase = 0.0
+        worst_pair = None
+        unsafe_positions = 0
+        for sample in range(ARRAY_CYCLE_CHECK_SAMPLES):
+            phase = sample / ARRAY_CYCLE_CHECK_SAMPLES
+            poses = self._array_poses(
+                self.array_angle_path, phase, count, spacing, phase_shift
+            )
+            clearance, closest, collisions = self._collision_state(poses)
+            if clearance < minimum:
+                minimum = clearance
+                worst_phase = phase
+                worst_pair = closest
+            if collisions:
+                unsafe_positions += 1
+
+        self.array_global_phase = worst_phase
+        self._draw_array_scene()
+        if count == 1:
+            self.array_status_var.set(
+                "One cilium has no neighbouring paddle collision to check."
+            )
+        elif worst_pair is None:
+            self.array_status_var.set("No comparable cilium pairs were found.")
+        else:
+            first, first_link, second, second_link = worst_pair
+            result = "UNSAFE" if minimum < COLLISION_MARGIN_MM else "CLEAR"
+            self.array_status_var.set(
+                f"{result}: minimum clearance {minimum:.3f} mm at global phase "
+                f"{worst_phase * 360.0:.1f} deg, between cilium {first + 1} "
+                f"{'lower' if first_link == 0 else 'upper'} and cilium "
+                f"{second + 1} {'lower' if second_link == 0 else 'upper'}. "
+                f"Positions below 2 mm: {unsafe_positions}/360."
+            )
+
+    def generate_safety_map(self) -> None:
+        if self.safety_map_running:
+            self.array_status_var.set("A safety-map calculation is already running.")
+            return
+        if not self.array_angle_path:
+            messagebox.showerror(
+                "No array path",
+                "Load the current path before generating a safety map.",
+                parent=self,
+            )
+            return
+        if self.array_cilia_count_var.get() == 1:
+            messagebox.showinfo(
+                "Safety map",
+                "At least two cilia are required for a spacing/phase collision map.",
+                parent=self,
+            )
+            return
+
+        self.pause_array(silent=True)
+        path = list(self.array_angle_path)
+        count = self.array_cilia_count_var.get()
+        spacing_values = [float(value) for value in range(34, 151, 4)]
+        if spacing_values[-1] != 150.0:
+            spacing_values.append(150.0)
+        phase_values = [float(value) for value in range(0, 361, 5)]
+        self.safety_map_running = True
+        self._safety_map_result = None
+        self.array_status_var.set(
+            "Generating sampled safety map: 4 mm spacing steps, 5 degree phase "
+            "steps and 72 time positions. The simulator remains responsive."
+        )
+
+        def worker() -> None:
+            matrix: list[list[int]] = []
+            for phase_shift in phase_values:
+                row = []
+                for spacing in spacing_values:
+                    unsafe = self._sampled_configuration_is_unsafe(
+                        path,
+                        count,
+                        spacing,
+                        phase_shift,
+                        72,
+                    )
+                    row.append(0 if unsafe else 1)
+                matrix.append(row)
+            self._safety_map_result = (spacing_values, phase_values, matrix, count)
+
+        self._safety_map_thread = threading.Thread(target=worker, daemon=True)
+        self._safety_map_thread.start()
+        self.after(250, self._poll_safety_map)
+
+    def _poll_safety_map(self) -> None:
+        result = getattr(self, "_safety_map_result", None)
+        if result is None:
+            if getattr(self, "_safety_map_thread", None) is not None:
+                if self._safety_map_thread.is_alive():
+                    self.after(250, self._poll_safety_map)
+                    return
+            self.safety_map_running = False
+            self.array_status_var.set("Safety-map calculation ended without a result.")
+            return
+
+        self.safety_map_running = False
+        spacing_values, phase_values, matrix, count = result
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.colors import ListedColormap
+        except ImportError:
+            self._show_safety_map_canvas(
+                spacing_values, phase_values, matrix, count
+            )
+            self.array_status_var.set(
+                "Safety map complete and shown in the built-in figure window. "
+                "Green cells passed the coarse scan; verify a selected setting "
+                "with the 360-position cycle check."
+            )
+            return
+
+        figure, axis = plt.subplots(figsize=(9, 5.5))
+        image = axis.imshow(
+            matrix,
+            origin="lower",
+            aspect="auto",
+            interpolation="nearest",
+            extent=[
+                spacing_values[0] - 2.0,
+                spacing_values[-1] + 2.0,
+                phase_values[0] - 2.5,
+                phase_values[-1] + 2.5,
+            ],
+            vmin=0,
+            vmax=1,
+            cmap=ListedColormap(["#d73027", "#1a9850"]),
+        )
+        axis.set_xlabel("Neighbouring lower-pivot spacing (mm)")
+        axis.set_ylabel("Adjacent phase shift (degrees)")
+        axis.set_title(
+            f"Sampled paddle-collision safety map ({count} cilia)\n"
+            "7.5 mm paddles, 2 mm margin; 72 time positions"
+        )
+        colourbar = figure.colorbar(image, ax=axis, ticks=[0.25, 0.75])
+        colourbar.ax.set_yticklabels(["Collision / <2 mm", "Sampled clear"])
+        figure.tight_layout()
+        plt.show(block=False)
+        self.array_status_var.set(
+            "Safety map complete. Green cells passed the coarse 72-position scan; "
+            "verify any selected setting with the 360-position cycle check."
+        )
+
+    def _show_safety_map_canvas(
+        self,
+        spacing_values: list[float],
+        phase_values: list[float],
+        matrix: list[list[int]],
+        count: int,
+    ) -> None:
+        """Render the map using only Tkinter when Matplotlib is unavailable."""
+
+        window = tk.Toplevel(self)
+        window.title(f"Phase-spacing safety map - {count} cilia")
+        window.geometry("940x650")
+        window.minsize(700, 500)
+        canvas = tk.Canvas(window, background="white", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+
+        def draw(_event: tk.Event | None = None) -> None:
+            canvas.delete("all")
+            width = max(canvas.winfo_width(), 700)
+            height = max(canvas.winfo_height(), 500)
+            left_margin = 92.0
+            right_margin = 38.0
+            top_margin = 92.0
+            bottom_margin = 88.0
+            plot_width = width - left_margin - right_margin
+            plot_height = height - top_margin - bottom_margin
+            column_width = plot_width / len(spacing_values)
+            row_height = plot_height / len(phase_values)
+
+            canvas.create_text(
+                width / 2.0,
+                25,
+                text=f"Sampled paddle-collision safety map ({count} cilia)",
+                font=("Segoe UI", 14, "bold"),
+            )
+            canvas.create_text(
+                width / 2.0,
+                51,
+                text="50 x 7.5 mm paddles, 2 mm clearance; 72 time positions",
+                font=("Segoe UI", 10),
+                fill="#37474f",
+            )
+
+            colours = {0: "#d73027", 1: "#1a9850"}
+            for row_index, row in enumerate(matrix):
+                canvas_row = len(phase_values) - 1 - row_index
+                y1 = top_margin + canvas_row * row_height
+                y2 = y1 + row_height
+                for column_index, value in enumerate(row):
+                    x1 = left_margin + column_index * column_width
+                    x2 = x1 + column_width
+                    canvas.create_rectangle(
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        fill=colours[value],
+                        outline="",
+                    )
+
+            plot_right = left_margin + plot_width
+            plot_bottom = top_margin + plot_height
+            canvas.create_rectangle(
+                left_margin,
+                top_margin,
+                plot_right,
+                plot_bottom,
+                outline="#263238",
+                width=1,
+            )
+
+            for index, spacing in enumerate(spacing_values):
+                if index % 4 != 0 and index != len(spacing_values) - 1:
+                    continue
+                x_position = left_margin + (index + 0.5) * column_width
+                canvas.create_line(
+                    x_position,
+                    plot_bottom,
+                    x_position,
+                    plot_bottom + 5,
+                    fill="#263238",
+                )
+                canvas.create_text(
+                    x_position,
+                    plot_bottom + 18,
+                    text=f"{spacing:.0f}",
+                    font=("Segoe UI", 8),
+                )
+
+            for index, phase_shift in enumerate(phase_values):
+                if int(phase_shift) % 30 != 0:
+                    continue
+                canvas_row = len(phase_values) - 1 - index
+                y_position = top_margin + (canvas_row + 0.5) * row_height
+                canvas.create_line(
+                    left_margin - 5,
+                    y_position,
+                    left_margin,
+                    y_position,
+                    fill="#263238",
+                )
+                canvas.create_text(
+                    left_margin - 10,
+                    y_position,
+                    text=f"{phase_shift:.0f}",
+                    anchor="e",
+                    font=("Segoe UI", 8),
+                )
+
+            canvas.create_text(
+                left_margin + plot_width / 2.0,
+                height - 38,
+                text="Neighbouring lower-pivot spacing (mm)",
+                font=("Segoe UI", 10, "bold"),
+            )
+            canvas.create_text(
+                24,
+                top_margin + plot_height / 2.0,
+                text="Adjacent phase shift (degrees)",
+                angle=90,
+                font=("Segoe UI", 10, "bold"),
+            )
+
+            legend_y = 70.0
+            canvas.create_rectangle(
+                width - 270,
+                legend_y - 8,
+                width - 254,
+                legend_y + 8,
+                fill=colours[0],
+                outline="",
+            )
+            canvas.create_text(
+                width - 248,
+                legend_y,
+                text="Collision / <2 mm",
+                anchor="w",
+                font=("Segoe UI", 9),
+            )
+            canvas.create_rectangle(
+                width - 135,
+                legend_y - 8,
+                width - 119,
+                legend_y + 8,
+                fill=colours[1],
+                outline="",
+            )
+            canvas.create_text(
+                width - 113,
+                legend_y,
+                text="Sampled clear",
+                anchor="w",
+                font=("Segoe UI", 9),
+            )
+
+        canvas.bind("<Configure>", draw)
+        window.after_idle(draw)
 
     # ------------------------------------------------------- Path actions
 
