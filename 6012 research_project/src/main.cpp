@@ -15,8 +15,9 @@
 ServoDriver board1;
 ServoDriver board2;
 
-constexpr uint8_t BOARD1_ADDR = 0x7F;
-constexpr uint8_t BOARD2_ADDR = 0x7E;
+// Physical installation: cilia 1-6 are on 0x7E and cilia 7-12 are on 0x7F.
+constexpr uint8_t BOARD1_ADDR = 0x7E;
+constexpr uint8_t BOARD2_ADDR = 0x7F;
 constexpr uint8_t CILIA_COUNT = 12;
 
 struct CiliumChannels
@@ -43,11 +44,19 @@ CiliumChannels cilia[CILIA_COUNT] = {
     {&board2, 13, 14}   // Cilium 12
 };
 
-// Raw-PWM limits produced by setServoPulseRange(500, 2500, 180)
-// in the installed Seeed library. No per-servo trim is applied.
-constexpr uint16_t MIN_SERVO_PWM = 122;
-constexpr uint16_t MAX_SERVO_PWM = 482;
-constexpr uint16_t HOME_PWM = 302;  // Exact setAngle(90) equivalent
+// Experimentally fitted common conversion used by the path designer:
+// PWM = 304.47 + 2.35018 * (desired angle - 90).
+// Gait-table values are already converted to raw PWM by the designer, so the
+// factor must not be applied again here. It is recorded here to derive the
+// common physical 90-degree home position and document the active calibration.
+constexpr float CALIBRATED_PWM_AT_90 = 304.47f;
+constexpr float CALIBRATED_COUNTS_PER_DEG = 2.35018f;
+
+// Retain the conservative raw-PWM bounds verified with pwm_test.ino.
+constexpr uint16_t MIN_SERVO_PWM = 150;
+constexpr uint16_t MAX_SERVO_PWM = 500;
+constexpr uint16_t HOME_PWM =
+    static_cast<uint16_t>(CALIBRATED_PWM_AT_90 + 0.5f);
 
 // ============================================================
 // MOTION SETTINGS
