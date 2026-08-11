@@ -10,10 +10,11 @@ The program uses the same angle convention as ``d_shape.py``:
 
 The tip can be moved by dragging it on the canvas, by changing its X/Y
 sliders, or by changing the two servo-angle sliders.  Points can be saved
-manually or captured continuously while Record Trace is enabled.  The
-resulting path can be exported as coordinates, joint-angle tables, or an
-Arduino-style header.  A second view simulates a phased array of up to 12
-cilia and checks the 50 x 7.5 mm paddles for a 2 mm safety clearance.
+manually or captured continuously while Record Trace is enabled.  Signed-height
+curves and tangent circular corner fillets can also be sampled directly into
+the path.  The resulting path can be exported as coordinates, joint-angle
+tables, or an Arduino-style header.  A second view simulates a phased array of
+up to 12 cilia and checks the 50 x 7.5 mm paddles for a 2 mm safety clearance.
 """
 
 from __future__ import annotations
@@ -345,6 +346,143 @@ def resample_polyline(points: list[PathPoint], sample_count: int) -> list[PathPo
     return result
 
 
+def quadratic_arc_coordinates(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    midpoint_height_mm: float,
+    sample_count: int,
+) -> list[tuple[float, float]]:
+    """Sample a quadratic curve with a signed perpendicular midpoint height."""
+
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    chord_length = math.hypot(dx, dy)
+    if chord_length <= 1e-9:
+        raise ValueError("The curved segment needs two different endpoints.")
+    sample_count = max(2, sample_count)
+
+    midpoint_x = (start[0] + end[0]) / 2.0
+    midpoint_y = (start[1] + end[1]) / 2.0
+    normal_x = -dy / chord_length
+    normal_y = dx / chord_length
+
+    # For a quadratic Bezier, placing the control point at twice the requested
+    # offset makes the curve itself pass through the requested midpoint height.
+    control_x = midpoint_x + 2.0 * midpoint_height_mm * normal_x
+    control_y = midpoint_y + 2.0 * midpoint_height_mm * normal_y
+
+    coordinates: list[tuple[float, float]] = []
+    for index in range(sample_count):
+        fraction = index / (sample_count - 1)
+        inverse = 1.0 - fraction
+        x_mm = (
+            inverse * inverse * start[0]
+            + 2.0 * inverse * fraction * control_x
+            + fraction * fraction * end[0]
+        )
+        y_mm = (
+            inverse * inverse * start[1]
+            + 2.0 * inverse * fraction * control_y
+            + fraction * fraction * end[1]
+        )
+        coordinates.append((x_mm, y_mm))
+    return coordinates
+
+
+def circular_fillet_coordinates(
+    first: tuple[float, float],
+    corner: tuple[float, float],
+    last: tuple[float, float],
+    requested_radius_mm: float,
+    sample_spacing_mm: float,
+) -> tuple[list[tuple[float, float]], float]:
+    """Return a tangent circular fillet for the corner ``first-corner-last``."""
+
+    if requested_radius_mm <= 0.0:
+        raise ValueError("The fillet radius must be greater than zero.")
+
+    first_dx = first[0] - corner[0]
+    first_dy = first[1] - corner[1]
+    last_dx = last[0] - corner[0]
+    last_dy = last[1] - corner[1]
+    first_length = math.hypot(first_dx, first_dy)
+    last_length = math.hypot(last_dx, last_dy)
+    if first_length <= 1e-9 or last_length <= 1e-9:
+        raise ValueError("The three fillet points must be different.")
+
+    first_unit = (first_dx / first_length, first_dy / first_length)
+    last_unit = (last_dx / last_length, last_dy / last_length)
+    dot = clamp(
+        first_unit[0] * last_unit[0] + first_unit[1] * last_unit[1],
+        -1.0,
+        1.0,
+    )
+    interior_angle = math.acos(dot)
+    if interior_angle <= math.radians(1.0):
+        raise ValueError("This corner reverses too sharply to create a stable fillet.")
+    if interior_angle >= math.radians(179.0):
+        raise ValueError("These three points are almost straight; no fillet is needed.")
+
+    tangent_factor = math.tan(interior_angle / 2.0)
+    requested_tangent_distance = requested_radius_mm / tangent_factor
+    maximum_tangent_distance = 0.49 * min(first_length, last_length)
+    tangent_distance = min(requested_tangent_distance, maximum_tangent_distance)
+    effective_radius = tangent_distance * tangent_factor
+
+    tangent_start = (
+        corner[0] + first_unit[0] * tangent_distance,
+        corner[1] + first_unit[1] * tangent_distance,
+    )
+    tangent_end = (
+        corner[0] + last_unit[0] * tangent_distance,
+        corner[1] + last_unit[1] * tangent_distance,
+    )
+
+    bisector_x = first_unit[0] + last_unit[0]
+    bisector_y = first_unit[1] + last_unit[1]
+    bisector_length = math.hypot(bisector_x, bisector_y)
+    if bisector_length <= 1e-9:
+        raise ValueError("These points do not define a usable corner fillet.")
+    bisector_x /= bisector_length
+    bisector_y /= bisector_length
+    centre_distance = effective_radius / math.sin(interior_angle / 2.0)
+    centre = (
+        corner[0] + bisector_x * centre_distance,
+        corner[1] + bisector_y * centre_distance,
+    )
+
+    start_angle = math.atan2(
+        tangent_start[1] - centre[1], tangent_start[0] - centre[0]
+    )
+    end_angle = math.atan2(
+        tangent_end[1] - centre[1], tangent_end[0] - centre[0]
+    )
+    incoming = (-first_unit[0], -first_unit[1])
+    turn_cross = incoming[0] * last_unit[1] - incoming[1] * last_unit[0]
+    if turn_cross > 0.0:
+        while end_angle <= start_angle:
+            end_angle += 2.0 * math.pi
+    else:
+        while end_angle >= start_angle:
+            end_angle -= 2.0 * math.pi
+
+    sweep = end_angle - start_angle
+    arc_length = abs(sweep) * effective_radius
+    spacing = max(0.05, sample_spacing_mm)
+    sample_count = max(3, int(math.ceil(arc_length / spacing)) + 1)
+    coordinates: list[tuple[float, float]] = []
+    for index in range(sample_count):
+        fraction = index / (sample_count - 1)
+        angle = start_angle + sweep * fraction
+        coordinates.append(
+            (
+                centre[0] + effective_radius * math.cos(angle),
+                centre[1] + effective_radius * math.sin(angle),
+            )
+        )
+    return coordinates, effective_radius
+
+
 class CiliaPathDesigner(tk.Tk):
     """Tkinter user interface for interactive cilium path design."""
 
@@ -368,6 +506,8 @@ class CiliaPathDesigner(tk.Tk):
         self.playback_index = 0
         self.playback_after_id: str | None = None
         self._updating_controls = False
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
 
         self.lower_var = tk.DoubleVar(value=self.lower_deg)
         self.upper_var = tk.DoubleVar(value=self.upper_deg)
@@ -381,6 +521,10 @@ class CiliaPathDesigner(tk.Tk):
         self.record_button_text = tk.StringVar(value="Start live trace")
         self.path_summary_var = tk.StringVar(value="Path: 0 points")
         self.trace_spacing_var = tk.DoubleVar(value=0.25)
+        self.arc_height_var = tk.DoubleVar(value=10.0)
+        self.arc_height_text = tk.StringVar(value="10.00")
+        self.fillet_radius_var = tk.DoubleVar(value=5.0)
+        self.fillet_radius_text = tk.StringVar(value="5.00")
         self.export_format_var = tk.StringVar(value="Coordinates CSV")
         self.sample_count_var = tk.IntVar(value=360)
         self.resample_var = tk.BooleanVar(value=True)
@@ -597,6 +741,80 @@ class CiliaPathDesigner(tk.Tk):
         ttk.Label(path_frame, textvariable=self.path_summary_var).pack(
             anchor="w", pady=(6, 0)
         )
+
+        curve_frame = ttk.LabelFrame(sidebar, text="Curves and corner fillets", padding=10)
+        curve_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            curve_frame,
+            text=(
+                "Arc: move the tip to the endpoint, then preview from the "
+                "final path point. Signed height selects the curve direction."
+            ),
+            wraplength=285,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+        self._add_slider(
+            curve_frame,
+            "Arc midpoint height",
+            self.arc_height_var,
+            -50.0,
+            50.0,
+            self.arc_height_text,
+            self._arc_height_changed,
+            lambda: self._typed_curve_value_changed("arc"),
+            "mm",
+        )
+        arc_buttons = ttk.Frame(curve_frame)
+        arc_buttons.pack(fill="x", pady=(0, 7))
+        ttk.Button(
+            arc_buttons,
+            text="Preview arc",
+            command=self.preview_arc_segment,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            arc_buttons,
+            text="Add arc",
+            command=self.apply_arc_segment,
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+
+        ttk.Separator(curve_frame, orient="horizontal").pack(fill="x", pady=(0, 7))
+        ttk.Label(
+            curve_frame,
+            text=(
+                "Fillet: save three consecutive straight-line points. The "
+                "middle point is replaced by a tangent circular corner."
+            ),
+            wraplength=285,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+        self._add_slider(
+            curve_frame,
+            "Fillet radius",
+            self.fillet_radius_var,
+            0.1,
+            40.0,
+            self.fillet_radius_text,
+            self._fillet_radius_changed,
+            lambda: self._typed_curve_value_changed("fillet"),
+            "mm",
+        )
+        fillet_buttons = ttk.Frame(curve_frame)
+        fillet_buttons.pack(fill="x", pady=(0, 6))
+        ttk.Button(
+            fillet_buttons,
+            text="Preview final corner",
+            command=self.preview_final_corner_fillet,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+        ttk.Button(
+            fillet_buttons,
+            text="Apply fillet",
+            command=self.apply_final_corner_fillet,
+        ).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        ttk.Button(
+            curve_frame,
+            text="Cancel curve preview",
+            command=self.cancel_curve_preview,
+        ).pack(fill="x")
 
         playback_frame = ttk.LabelFrame(sidebar, text="Path simulation", padding=10)
         playback_frame.pack(fill="x", pady=(0, 8))
@@ -1055,6 +1273,43 @@ class CiliaPathDesigner(tk.Tk):
             self.y_var.set(value)
         self._coordinates_changed()
 
+    def _arc_height_changed(self, _value: str = "") -> None:
+        self.arc_height_text.set(f"{self.arc_height_var.get():.2f}")
+        if self.arc_preview_active:
+            self._draw_scene()
+
+    def _fillet_radius_changed(self, _value: str = "") -> None:
+        self.fillet_radius_text.set(f"{self.fillet_radius_var.get():.2f}")
+        if self.fillet_preview_active:
+            self._draw_scene()
+
+    def _typed_curve_value_changed(self, control: str) -> None:
+        if control == "arc":
+            text_variable = self.arc_height_text
+            target_variable = self.arc_height_var
+            minimum, maximum = -50.0, 50.0
+            callback = self._arc_height_changed
+        else:
+            text_variable = self.fillet_radius_text
+            target_variable = self.fillet_radius_var
+            minimum, maximum = 0.1, 40.0
+            callback = self._fillet_radius_changed
+
+        try:
+            value = float(text_variable.get().strip())
+        except ValueError:
+            self.status_var.set("Enter a valid curve value, for example 8.5.")
+            callback()
+            return
+        if not minimum <= value <= maximum:
+            self.status_var.set(
+                f"Curve value must be between {minimum:g} and {maximum:g} mm."
+            )
+            callback()
+            return
+        target_variable.set(value)
+        callback()
+
     def _move_tip_to(self, x_mm: float, y_mm: float) -> bool:
         angles = inverse_kinematics(
             x_mm,
@@ -1244,6 +1499,54 @@ class CiliaPathDesigner(tk.Tk):
                 outline="white",
                 width=1,
             )
+
+        # Live curve previews are overlays only; the path is not changed until
+        # the matching Add/Apply button is pressed.
+        if self.arc_preview_active:
+            try:
+                preview = self._arc_preview_coordinates(81)
+                preview_canvas: list[float] = []
+                for x_mm, y_mm in preview:
+                    preview_canvas.extend(self._world_to_canvas(x_mm, y_mm))
+                self.canvas.create_line(
+                    *preview_canvas,
+                    fill="#ef6c00",
+                    width=3,
+                    dash=(7, 4),
+                    capstyle="round",
+                    joinstyle="round",
+                )
+            except ValueError:
+                pass
+
+        if self.fillet_preview_active:
+            try:
+                first, corner, last = self._final_fillet_points()
+                fillet, _effective_radius = circular_fillet_coordinates(
+                    (first.x_mm, first.y_mm),
+                    (corner.x_mm, corner.y_mm),
+                    (last.x_mm, last.y_mm),
+                    self.fillet_radius_var.get(),
+                    max(0.05, self.trace_spacing_var.get()),
+                )
+                replacement = [
+                    (first.x_mm, first.y_mm),
+                    *fillet,
+                    (last.x_mm, last.y_mm),
+                ]
+                preview_canvas = []
+                for x_mm, y_mm in replacement:
+                    preview_canvas.extend(self._world_to_canvas(x_mm, y_mm))
+                self.canvas.create_line(
+                    *preview_canvas,
+                    fill="#8e24aa",
+                    width=4,
+                    dash=(7, 4),
+                    capstyle="round",
+                    joinstyle="round",
+                )
+            except ValueError:
+                pass
 
         # Two-link cilium.
         base_canvas = self._world_to_canvas(0.0, 0.0)
@@ -2210,6 +2513,208 @@ class CiliaPathDesigner(tk.Tk):
 
     # ------------------------------------------------------- Path actions
 
+    def _arc_preview_coordinates(
+        self, sample_count: int
+    ) -> list[tuple[float, float]]:
+        if not self.path_points:
+            raise ValueError("Save a starting path point before creating an arc.")
+        start = self.path_points[-1]
+        return quadratic_arc_coordinates(
+            (start.x_mm, start.y_mm),
+            (self.tip_x_mm, self.tip_y_mm),
+            self.arc_height_var.get(),
+            sample_count,
+        )
+
+    def _final_fillet_points(self) -> tuple[PathPoint, PathPoint, PathPoint]:
+        if len(self.path_points) < 3:
+            raise ValueError("Save three straight-line points before adding a fillet.")
+        points = self.path_points[-3:]
+        if any(point.source != "saved" for point in points):
+            raise ValueError(
+                "The final three path points must be manually saved straight-line "
+                "points. Undo or save a fresh three-point corner first."
+            )
+        return points[0], points[1], points[2]
+
+    @staticmethod
+    def _coordinates_to_path_points(
+        coordinates: list[tuple[float, float]],
+        reference_angles: tuple[float, float],
+        source: str,
+        final_point_saved: bool = False,
+    ) -> list[PathPoint]:
+        points: list[PathPoint] = []
+        reference = reference_angles
+        for index, (x_mm, y_mm) in enumerate(coordinates):
+            angles = inverse_kinematics(x_mm, y_mm, reference)
+            if angles is None:
+                raise ValueError(
+                    f"Curve point ({x_mm:.2f}, {y_mm:.2f}) mm is outside the "
+                    "reachable 0-180 degree servo workspace."
+                )
+            point_source = (
+                "saved"
+                if final_point_saved and index == len(coordinates) - 1
+                else source
+            )
+            points.append(PathPoint(x_mm, y_mm, angles[0], angles[1], point_source))
+            reference = angles
+        return points
+
+    def preview_arc_segment(self) -> None:
+        self.stop_playback(silent=True)
+        try:
+            coordinates = self._arc_preview_coordinates(81)
+            start = self.path_points[-1]
+            self._coordinates_to_path_points(
+                coordinates[1:],
+                (start.lower_deg, start.upper_deg),
+                "arc",
+            )
+        except ValueError as error:
+            self.arc_preview_active = False
+            self.status_var.set(str(error))
+            self._draw_scene()
+            return
+        self.recording = False
+        self.record_button_text.set("Start live trace")
+        self.arc_preview_active = True
+        self.fillet_preview_active = False
+        self.status_var.set(
+            "Arc preview active. Move the tip or adjust/type the signed midpoint "
+            "height, then press Add arc."
+        )
+        self._draw_scene()
+
+    def apply_arc_segment(self) -> None:
+        self.stop_playback(silent=True)
+        try:
+            dense = self._arc_preview_coordinates(101)
+            estimated_length = sum(
+                math.hypot(current[0] - previous[0], current[1] - previous[1])
+                for previous, current in zip(dense, dense[1:])
+            )
+            spacing = max(0.05, self.trace_spacing_var.get())
+            sample_count = max(2, int(math.ceil(estimated_length / spacing)) + 1)
+            coordinates = self._arc_preview_coordinates(sample_count)
+            start = self.path_points[-1]
+            new_points = self._coordinates_to_path_points(
+                coordinates[1:],
+                (start.lower_deg, start.upper_deg),
+                "arc",
+                final_point_saved=True,
+            )
+        except ValueError as error:
+            self.status_var.set(str(error))
+            self._draw_scene()
+            return
+
+        self._push_history()
+        self.path_points.extend(new_points)
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
+        self.recording = False
+        self.record_button_text.set("Start live trace")
+        final = self.path_points[-1]
+        self.lower_deg, self.upper_deg = final.lower_deg, final.upper_deg
+        self.tip_x_mm, self.tip_y_mm = final.x_mm, final.y_mm
+        self._sync_controls()
+        self._update_path_summary()
+        self.status_var.set(
+            f"Added a {len(new_points)}-sample curved segment with midpoint "
+            f"height {self.arc_height_var.get():.2f} mm. Undo removes it as one action."
+        )
+        self._draw_scene()
+
+    def preview_final_corner_fillet(self) -> None:
+        self.stop_playback(silent=True)
+        try:
+            first, corner, last = self._final_fillet_points()
+            coordinates, effective_radius = circular_fillet_coordinates(
+                (first.x_mm, first.y_mm),
+                (corner.x_mm, corner.y_mm),
+                (last.x_mm, last.y_mm),
+                self.fillet_radius_var.get(),
+                max(0.05, self.trace_spacing_var.get()),
+            )
+            validation_coordinates = [*coordinates, (last.x_mm, last.y_mm)]
+            self._coordinates_to_path_points(
+                validation_coordinates,
+                (first.lower_deg, first.upper_deg),
+                "fillet",
+                final_point_saved=True,
+            )
+        except ValueError as error:
+            self.fillet_preview_active = False
+            self.status_var.set(str(error))
+            self._draw_scene()
+            return
+        self.recording = False
+        self.record_button_text.set("Start live trace")
+        self.arc_preview_active = False
+        self.fillet_preview_active = True
+        radius_note = ""
+        if effective_radius < self.fillet_radius_var.get() - 1e-6:
+            radius_note = f" (limited by segment length to {effective_radius:.2f} mm)"
+        self.status_var.set(
+            f"Final-corner fillet preview active at radius {effective_radius:.2f} mm"
+            f"{radius_note}. Adjust the slider or type a value, then Apply fillet."
+        )
+        self._draw_scene()
+
+    def apply_final_corner_fillet(self) -> None:
+        self.stop_playback(silent=True)
+        try:
+            first, corner, last = self._final_fillet_points()
+            coordinates, effective_radius = circular_fillet_coordinates(
+                (first.x_mm, first.y_mm),
+                (corner.x_mm, corner.y_mm),
+                (last.x_mm, last.y_mm),
+                self.fillet_radius_var.get(),
+                max(0.05, self.trace_spacing_var.get()),
+            )
+            replacement_coordinates = [*coordinates, (last.x_mm, last.y_mm)]
+            replacement = self._coordinates_to_path_points(
+                replacement_coordinates,
+                (first.lower_deg, first.upper_deg),
+                "fillet",
+                final_point_saved=True,
+            )
+        except ValueError as error:
+            self.status_var.set(str(error))
+            self._draw_scene()
+            return
+
+        self._push_history()
+        # Keep the first of the three points, replace the sharp corner and the
+        # old final point with the tangent arc plus a newly solved final point.
+        self.path_points = [*self.path_points[:-2], *replacement]
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
+        self.recording = False
+        self.record_button_text.set("Start live trace")
+        final = self.path_points[-1]
+        self.lower_deg, self.upper_deg = final.lower_deg, final.upper_deg
+        self.tip_x_mm, self.tip_y_mm = final.x_mm, final.y_mm
+        self._sync_controls()
+        self._update_path_summary()
+        self.status_var.set(
+            f"Applied a tangent corner fillet of radius {effective_radius:.2f} mm. "
+            "Undo restores the sharp three-point corner."
+        )
+        self._draw_scene()
+
+    def cancel_curve_preview(self, silent: bool = False) -> None:
+        was_active = self.arc_preview_active or self.fillet_preview_active
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
+        if not silent:
+            self.status_var.set(
+                "Curve preview cancelled." if was_active else "No curve preview is active."
+            )
+        self._draw_scene()
+
     def _current_point(self, source: str) -> PathPoint:
         return PathPoint(
             self.tip_x_mm,
@@ -2243,6 +2748,8 @@ class CiliaPathDesigner(tk.Tk):
 
     def save_coordinate(self) -> None:
         self.stop_playback(silent=True)
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
         self._push_history()
         self.path_points.append(self._current_point("saved"))
         self._update_path_summary()
@@ -2254,6 +2761,8 @@ class CiliaPathDesigner(tk.Tk):
 
     def toggle_recording(self) -> None:
         self.stop_playback(silent=True)
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
         if self.recording:
             self.recording = False
             self.record_button_text.set("Start live trace")
@@ -2290,6 +2799,8 @@ class CiliaPathDesigner(tk.Tk):
 
     def undo(self) -> None:
         self.stop_playback(silent=True)
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
         if not self.history:
             self.status_var.set("Nothing to undo.")
             return
@@ -2302,6 +2813,8 @@ class CiliaPathDesigner(tk.Tk):
 
     def clear_path(self) -> None:
         self.stop_playback(silent=True)
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
         if not self.path_points:
             self.status_var.set("The path is already empty.")
             return
@@ -2317,6 +2830,8 @@ class CiliaPathDesigner(tk.Tk):
         """Return the mechanism exactly to the final recorded path point."""
 
         self.stop_playback(silent=True)
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
         if not self.path_points:
             self.status_var.set("There is no path point to snap to yet.")
             return
@@ -2342,6 +2857,8 @@ class CiliaPathDesigner(tk.Tk):
         """Animate the linkage through a uniformly sampled recorded path."""
 
         self.stop_playback(silent=True)
+        self.arc_preview_active = False
+        self.fillet_preview_active = False
         if len(self.path_points) < 2:
             messagebox.showerror(
                 "Cannot play path",
@@ -2473,19 +2990,30 @@ class CiliaPathDesigner(tk.Tk):
 
         try:
             destination_path = Path(destination)
+            preview_path: Path | None = None
             if export_format == "Coordinates CSV":
                 self._write_coordinate_csv(destination_path, points)
             elif export_format == "Joint angles CSV":
                 self._write_angle_csv(destination_path, points)
             else:
                 self._write_arduino_header(destination_path, points)
+                preview_path = destination_path.with_name(
+                    f"{destination_path.stem}_tip_path.png"
+                )
+                self._write_tip_path_png(preview_path, destination_path.name, points)
         except (OSError, ValueError) as error:
             messagebox.showerror("Export failed", str(error), parent=self)
             return
 
-        self.status_var.set(
-            f"Exported {len(points)} lookup points to {destination_path}."
-        )
+        if preview_path is None:
+            self.status_var.set(
+                f"Exported {len(points)} lookup points to {destination_path}."
+            )
+        else:
+            self.status_var.set(
+                f"Exported {len(points)} lookup points to {destination_path} and "
+                f"saved the matching tip-path image as {preview_path.name}."
+            )
 
     @staticmethod
     def _write_coordinate_csv(path: Path, points: list[PathPoint]) -> None:
@@ -2560,6 +3088,324 @@ class CiliaPathDesigner(tk.Tk):
             ]
         )
         path.write_text(contents, encoding="utf-8")
+
+    @staticmethod
+    def _write_tip_path_png(
+        path: Path,
+        header_name: str,
+        points: list[PathPoint],
+    ) -> None:
+        """Save a visual record of the exact tip points exported to a header."""
+
+        if len(points) < 2:
+            raise ValueError("At least two points are required for the path PNG.")
+        try:
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            from matplotlib.figure import Figure
+        except ImportError:
+            CiliaPathDesigner._write_tip_path_png_with_pillow(
+                path, header_name, points
+            )
+            return
+
+        x_values = [point.x_mm for point in points]
+        y_values = [point.y_mm for point in points]
+        # Arduino playback interpolates cyclically from the last lookup sample
+        # back to the first, so show that closing segment in the reference PNG.
+        closed_x = [*x_values, x_values[0]]
+        closed_y = [*y_values, y_values[0]]
+        phases = [index / len(points) for index in range(len(points))]
+
+        figure = Figure(figsize=(9.0, 5.6), dpi=180, facecolor="white")
+        FigureCanvasAgg(figure)
+        axes = figure.add_subplot(1, 1, 1)
+        axes.plot(
+            closed_x,
+            closed_y,
+            color="#e66b0e",
+            linewidth=2.4,
+            label="Commanded cyclic tip path",
+            zorder=2,
+        )
+        phase_points = axes.scatter(
+            x_values,
+            y_values,
+            c=phases,
+            cmap="viridis",
+            s=12,
+            edgecolors="none",
+            zorder=3,
+        )
+        axes.scatter(
+            [x_values[0]],
+            [y_values[0]],
+            marker="o",
+            s=70,
+            color="#2e7d32",
+            edgecolors="white",
+            linewidths=1.0,
+            label="Lookup-table start",
+            zorder=4,
+        )
+
+        # Add several small arrows so the direction remains obvious even when
+        # the first and last samples are close together.
+        arrow_count = min(4, len(points) - 1)
+        for arrow_index in range(arrow_count):
+            index = int(arrow_index * len(points) / arrow_count)
+            next_index = (index + 1) % len(points)
+            dx = x_values[next_index] - x_values[index]
+            dy = y_values[next_index] - y_values[index]
+            if math.hypot(dx, dy) <= 1e-9:
+                continue
+            axes.annotate(
+                "",
+                xy=(x_values[next_index], y_values[next_index]),
+                xytext=(x_values[index], y_values[index]),
+                arrowprops={
+                    "arrowstyle": "-|>",
+                    "color": "#263238",
+                    "lw": 1.3,
+                    "mutation_scale": 11,
+                },
+                zorder=5,
+            )
+
+        axes.set_title(
+            f"Commanded cilium-tip path from {header_name}",
+            fontsize=13,
+            pad=12,
+        )
+        axes.set_xlabel("Tip X position (mm)")
+        axes.set_ylabel("Tip Y position (mm)")
+        axes.set_aspect("equal", adjustable="datalim")
+        axes.grid(True, color="#d7dce1", linewidth=0.8, alpha=0.8)
+        axes.legend(loc="best", frameon=True)
+        colour_bar = figure.colorbar(phase_points, ax=axes, pad=0.025)
+        colour_bar.set_label("Normalised gait phase")
+        axes.text(
+            0.01,
+            0.01,
+            (
+                f"{len(points)} lookup samples\n"
+                f"PWM = {PWM_AT_90_COUNT:.2f} + {PWM_COUNTS_PER_DEG:.5f} "
+                "x (angle - 90 deg)"
+            ),
+            transform=axes.transAxes,
+            fontsize=8.5,
+            va="bottom",
+            ha="left",
+            bbox={
+                "boxstyle": "round,pad=0.35",
+                "facecolor": "white",
+                "edgecolor": "#b0b7bf",
+                "alpha": 0.9,
+            },
+        )
+        figure.tight_layout()
+        figure.savefig(path, format="png", dpi=180, facecolor="white")
+
+    @staticmethod
+    def _write_tip_path_png_with_pillow(
+        path: Path,
+        header_name: str,
+        points: list[PathPoint],
+    ) -> None:
+        """Dependency-light PNG fallback when matplotlib is unavailable."""
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError as error:
+            raise ValueError(
+                "The header was written, but matplotlib or Pillow is required "
+                "to create the matching tip-path PNG."
+            ) from error
+
+        width, height = 1600, 1000
+        plot_left, plot_top = 150, 115
+        plot_right, plot_bottom = 1460, 835
+        image = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(image)
+
+        def load_font(size: int, bold: bool = False):
+            filename = "arialbd.ttf" if bold else "arial.ttf"
+            windows_font = Path("C:/Windows/Fonts") / filename
+            try:
+                return ImageFont.truetype(str(windows_font), size)
+            except OSError:
+                try:
+                    return ImageFont.truetype(filename, size)
+                except OSError:
+                    return ImageFont.load_default()
+
+        title_font = load_font(30, bold=True)
+        label_font = load_font(22)
+        tick_font = load_font(17)
+        note_font = load_font(18)
+
+        x_values = [point.x_mm for point in points]
+        y_values = [point.y_mm for point in points]
+        x_min, x_max = min(x_values), max(x_values)
+        y_min, y_max = min(y_values), max(y_values)
+        x_span = max(1.0, x_max - x_min)
+        y_span = max(1.0, y_max - y_min)
+        padding = max(3.0, 0.08 * max(x_span, y_span))
+        x_min -= padding
+        x_max += padding
+        y_min -= padding
+        y_max += padding
+        x_span = x_max - x_min
+        y_span = y_max - y_min
+
+        available_width = plot_right - plot_left
+        available_height = plot_bottom - plot_top
+        scale = min(available_width / x_span, available_height / y_span)
+        drawn_width = x_span * scale
+        drawn_height = y_span * scale
+        x_offset = plot_left + (available_width - drawn_width) / 2.0
+        y_offset = plot_top + (available_height - drawn_height) / 2.0
+
+        def transform(x_mm: float, y_mm: float) -> tuple[float, float]:
+            return (
+                x_offset + (x_mm - x_min) * scale,
+                y_offset + drawn_height - (y_mm - y_min) * scale,
+            )
+
+        def nice_step(span: float) -> float:
+            rough = span / 8.0
+            power = 10.0 ** math.floor(math.log10(max(rough, 1e-9)))
+            scaled = rough / power
+            multiplier = 1.0 if scaled <= 1.0 else 2.0 if scaled <= 2.0 else 5.0
+            return multiplier * power
+
+        x_step = nice_step(x_span)
+        y_step = nice_step(y_span)
+        x_tick = math.ceil(x_min / x_step) * x_step
+        while x_tick <= x_max + 1e-9:
+            x_pixel, _ = transform(x_tick, y_min)
+            draw.line(
+                [(x_pixel, y_offset), (x_pixel, y_offset + drawn_height)],
+                fill="#d9dde2",
+                width=2,
+            )
+            label = f"{x_tick:g}"
+            box = draw.textbbox((0, 0), label, font=tick_font)
+            draw.text(
+                (x_pixel - (box[2] - box[0]) / 2, y_offset + drawn_height + 10),
+                label,
+                fill="#42474d",
+                font=tick_font,
+            )
+            x_tick += x_step
+
+        y_tick = math.ceil(y_min / y_step) * y_step
+        while y_tick <= y_max + 1e-9:
+            _, y_pixel = transform(x_min, y_tick)
+            draw.line(
+                [(x_offset, y_pixel), (x_offset + drawn_width, y_pixel)],
+                fill="#d9dde2",
+                width=2,
+            )
+            label = f"{y_tick:g}"
+            box = draw.textbbox((0, 0), label, font=tick_font)
+            draw.text(
+                (x_offset - (box[2] - box[0]) - 12, y_pixel - 10),
+                label,
+                fill="#42474d",
+                font=tick_font,
+            )
+            y_tick += y_step
+
+        draw.rectangle(
+            [x_offset, y_offset, x_offset + drawn_width, y_offset + drawn_height],
+            outline="#68727d",
+            width=3,
+        )
+        pixel_points = [transform(point.x_mm, point.y_mm) for point in points]
+        draw.line([*pixel_points, pixel_points[0]], fill="#e66b0e", width=5)
+
+        def phase_colour(fraction: float) -> tuple[int, int, int]:
+            # Compact blue-green-yellow progression similar to viridis.
+            stops = (
+                (0.0, (68, 1, 84)),
+                (0.5, (33, 145, 140)),
+                (1.0, (253, 231, 37)),
+            )
+            first, second = (stops[0], stops[1]) if fraction <= 0.5 else (stops[1], stops[2])
+            local = (fraction - first[0]) / (second[0] - first[0])
+            return tuple(
+                round(first[1][channel] + local * (second[1][channel] - first[1][channel]))
+                for channel in range(3)
+            )
+
+        for index, (x_pixel, y_pixel) in enumerate(pixel_points):
+            fraction = index / max(1, len(pixel_points) - 1)
+            radius = 5
+            draw.ellipse(
+                [x_pixel - radius, y_pixel - radius, x_pixel + radius, y_pixel + radius],
+                fill=phase_colour(fraction),
+            )
+
+        start_x, start_y = pixel_points[0]
+        draw.ellipse(
+            [start_x - 11, start_y - 11, start_x + 11, start_y + 11],
+            fill="#2e7d32",
+            outline="white",
+            width=3,
+        )
+
+        arrow_count = min(4, len(pixel_points) - 1)
+        step = max(1, len(pixel_points) // 50)
+        for arrow_index in range(arrow_count):
+            index = int(arrow_index * len(pixel_points) / arrow_count)
+            next_index = (index + step) % len(pixel_points)
+            start = pixel_points[index]
+            end = pixel_points[next_index]
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length = math.hypot(dx, dy)
+            if length <= 1e-6:
+                continue
+            unit_x, unit_y = dx / length, dy / length
+            normal_x, normal_y = -unit_y, unit_x
+            tip = end
+            base = (tip[0] - 18 * unit_x, tip[1] - 18 * unit_y)
+            draw.polygon(
+                [
+                    tip,
+                    (base[0] + 8 * normal_x, base[1] + 8 * normal_y),
+                    (base[0] - 8 * normal_x, base[1] - 8 * normal_y),
+                ],
+                fill="#263238",
+            )
+
+        title = f"Commanded cilium-tip path from {header_name}"
+        title_box = draw.textbbox((0, 0), title, font=title_font)
+        draw.text(
+            ((width - (title_box[2] - title_box[0])) / 2, 35),
+            title,
+            fill="#202428",
+            font=title_font,
+        )
+        x_label = "Tip X position (mm)"
+        x_box = draw.textbbox((0, 0), x_label, font=label_font)
+        draw.text(
+            ((width - (x_box[2] - x_box[0])) / 2, 895),
+            x_label,
+            fill="#202428",
+            font=label_font,
+        )
+        y_label_image = Image.new("RGBA", (45, 280), (255, 255, 255, 0))
+        y_draw = ImageDraw.Draw(y_label_image)
+        y_draw.text((5, 5), "Tip Y position (mm)", fill="#202428", font=label_font)
+        y_label_image = y_label_image.rotate(90, expand=True)
+        image.paste(y_label_image, (25, int((height - y_label_image.height) / 2)), y_label_image)
+
+        note = (
+            f"Start: green marker   |   {len(points)} lookup samples   |   "
+            f"PWM = {PWM_AT_90_COUNT:.2f} + {PWM_COUNTS_PER_DEG:.5f} x (angle - 90 deg)"
+        )
+        draw.text((plot_left, 950), note, fill="#42474d", font=note_font)
+        image.save(path, format="PNG")
 
 
 def main() -> None:

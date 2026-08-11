@@ -1,0 +1,2 @@
+Test ID,Candidate Interval Number,Interval Start Time (s),Interval End Time (s),Measured Interval Duration (s),Expected Cycle Duration (s),Rejection Reason
+phase180_rep2,4,10.095660922330097,11.828249595469256,1.7325886731391584,3.0,Duration outside 2.40-3.60 s complete-cycle range

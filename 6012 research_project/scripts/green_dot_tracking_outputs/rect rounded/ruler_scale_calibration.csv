@@ -1,0 +1,2 @@
+ruler_reference_length_mm,checkerboard_measured_ruler_length_before_correction_mm,ruler_scale_correction_factor,corrected_ruler_length_mm,corrected_pixels_per_mm,corrected_mm_per_pixel,ruler_point_1_x_px,ruler_point_1_y_px,ruler_point_2_x_px,ruler_point_2_y_px
+100.0,101.09989166259766,0.9891207434102072,100.00000762939453,5.540799551610507,0.18047936776729934,686.0,505.0,1241.0,500.0

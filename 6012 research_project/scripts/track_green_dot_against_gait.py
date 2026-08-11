@@ -2,12 +2,14 @@
 
 Recording sequence expected by this script:
 
-* 0-2 s: keep the complete checkerboard visible in the cilium motion plane;
+* 0-2 s: keep the complete checkerboard and a 100 mm ruler span visible in the
+  cilium motion plane;
 * 2-4 s: remove the checkerboard and your hand;
 * 4 s onward: track the green marker during gait entry and looping motion.
 
-The checkerboard supplies both the pixel/mm scale and a planar perspective
-mapping. The theoretical path is reconstructed from the current raw-PWM
+The checkerboard supplies the planar perspective mapping and an initial
+pixel/mm scale. Two clicks on ruler marks 100 mm apart then correct that scale
+in the cilium motion plane. The theoretical path is reconstructed from the current raw-PWM
 ``gait_table.h`` using the same two-link forward kinematics as the path
 designer. The measured and commanded paths are compared geometrically, without
 assuming a gait start time, cycle speed or phase. The checkerboard fixes the
@@ -36,7 +38,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Replace this filename after copying the recording into camera_calibration.
 VIDEO_PATH = Path(
-    r"C:\Users\simon\OneDrive - University of Southampton\Documents\02_Uni\01_Masters\6012 research project\code\camera_calibration\20260805_143536.mp4"
+    r"C:\Users\simon\OneDrive - University of Southampton\Documents\02_Uni\01_Masters\6012 research project\code\camera_calibration\20260808_181841.mp4"
 )
 
 GAIT_HEADER_PATH = SCRIPT_DIR.parent / "include" / "gait_table.h"
@@ -52,8 +54,12 @@ CALIBRATION_START_S = 0.0
 CALIBRATION_END_S = 2.0
 CHECKERBOARD_FRAME_STEP = 2
 
+# After checkerboard detection, click two ruler marks exactly this far apart.
+# The ruler must be in the same plane as the green marker's motion.
+RULER_REFERENCE_LENGTH_MM = 100.0
+
 # Two seconds are deliberately left between calibration and tracking.
-TRACKING_START_S = 6.5
+TRACKING_START_S = 6.0
 
 # Artificial-cilium geometry and servo convention.
 LOWER_LINK_LENGTH_MM = 50.0
@@ -122,6 +128,14 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Output folder; defaults to a folder named after the video.",
+    )
+    parser.add_argument(
+        "--skip-ruler",
+        action="store_true",
+        help=(
+            "Use the checkerboard scale without the interactive 100 mm ruler "
+            "correction (mainly for rerunning older recordings)."
+        ),
     )
     return parser.parse_args()
 
@@ -416,6 +430,166 @@ def calibrate_video_plane(
         output_folder / "checkerboard_calibration.csv", index=False
     )
     return best
+
+
+def select_two_ruler_marks(image: np.ndarray) -> np.ndarray:
+    """Interactively select two ruler marks exactly 100 mm apart."""
+
+    title = "Ruler scale correction - select two marks 100 mm apart"
+    points: list[tuple[int, int]] = []
+
+    def mouse(event: int, x: int, y: int, _flags: int, _data: object) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
+            points.append((x, y))
+
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(title, min(1500, image.shape[1]), min(850, image.shape[0]))
+    cv2.setMouseCallback(title, mouse)
+    while True:
+        display = image.copy()
+        cv2.rectangle(display, (0, 0), (display.shape[1], 96), (0, 0, 0), -1)
+        instructions = [
+            "Click two ruler marks exactly 100 mm apart in the green-dot motion plane.",
+            "Enter = accept | Backspace = undo | Esc = cancel",
+        ]
+        for row, line in enumerate(instructions):
+            cv2.putText(
+                display,
+                line,
+                (15, 33 + row * 34),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.72,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        for number, point in enumerate(points, 1):
+            cv2.circle(display, point, 9, (0, 255, 255), -1, cv2.LINE_AA)
+            cv2.putText(
+                display,
+                str(number),
+                (point[0] + 12, point[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        if len(points) == 2:
+            cv2.line(display, points[0], points[1], (0, 255, 255), 3, cv2.LINE_AA)
+        cv2.imshow(title, display)
+        key = cv2.waitKey(25) & 0xFF
+        if key in (8, 127) and points:
+            points.pop()
+        elif key in (10, 13) and len(points) == 2:
+            break
+        elif key == 27:
+            cv2.destroyWindow(title)
+            raise KeyboardInterrupt("Ruler selection cancelled.")
+    cv2.destroyWindow(title)
+    return np.asarray(points, dtype=np.float32)
+
+
+def apply_ruler_scale_correction(
+    capture: cv2.VideoCapture,
+    plane: PlaneCalibration,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    new_camera_matrix: np.ndarray,
+    output_folder: Path,
+) -> dict[str, float]:
+    """Correct the checkerboard homography using a clicked 100 mm reference."""
+
+    capture.set(cv2.CAP_PROP_POS_FRAMES, plane.frame_index)
+    success, raw = capture.read()
+    if not success:
+        raise RuntimeError(
+            f"Could not read ruler-selection frame {plane.frame_index}."
+        )
+    frame = undistort_frame(raw, camera_matrix, distortion, new_camera_matrix)
+    points_px = select_two_ruler_marks(frame)
+    points_mm_before = cv2.perspectiveTransform(
+        points_px.reshape(-1, 1, 2), plane.image_to_checkerboard_mm
+    ).reshape(-1, 2)
+    measured_before_mm = float(
+        np.linalg.norm(points_mm_before[1] - points_mm_before[0])
+    )
+    if measured_before_mm <= 1e-6:
+        raise ValueError("The two ruler clicks must be at different positions.")
+
+    correction = RULER_REFERENCE_LENGTH_MM / measured_before_mm
+    plane.image_to_checkerboard_mm[:2, :] *= correction
+    plane.mm_per_pixel *= correction
+    plane.pixels_per_mm /= correction
+
+    points_mm_after = cv2.perspectiveTransform(
+        points_px.reshape(-1, 1, 2), plane.image_to_checkerboard_mm
+    ).reshape(-1, 2)
+    measured_after_mm = float(
+        np.linalg.norm(points_mm_after[1] - points_mm_after[0])
+    )
+
+    annotated = frame.copy()
+    first = tuple(np.round(points_px[0]).astype(int))
+    second = tuple(np.round(points_px[1]).astype(int))
+    cv2.line(annotated, first, second, (0, 255, 255), 4, cv2.LINE_AA)
+    for number, point in enumerate((first, second), 1):
+        cv2.circle(annotated, point, 10, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            annotated,
+            str(number),
+            (point[0] + 12, point[1] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    label = (
+        f"Checkerboard measured {measured_before_mm:.2f} mm; "
+        f"scale x {correction:.6f}; corrected to {measured_after_mm:.2f} mm"
+    )
+    cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 50), (0, 0, 0), -1)
+    cv2.putText(
+        annotated,
+        label,
+        (15, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.70,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    if not cv2.imwrite(str(output_folder / "ruler_scale_calibration.png"), annotated):
+        raise RuntimeError("Could not save the ruler calibration preview.")
+
+    result = {
+        "ruler_reference_length_mm": RULER_REFERENCE_LENGTH_MM,
+        "checkerboard_measured_ruler_length_before_correction_mm": measured_before_mm,
+        "ruler_scale_correction_factor": correction,
+        "corrected_ruler_length_mm": measured_after_mm,
+        "corrected_pixels_per_mm": plane.pixels_per_mm,
+        "corrected_mm_per_pixel": plane.mm_per_pixel,
+        "ruler_point_1_x_px": float(points_px[0, 0]),
+        "ruler_point_1_y_px": float(points_px[0, 1]),
+        "ruler_point_2_x_px": float(points_px[1, 0]),
+        "ruler_point_2_y_px": float(points_px[1, 1]),
+    }
+    pd.DataFrame([result]).to_csv(
+        output_folder / "ruler_scale_calibration.csv", index=False
+    )
+
+    checkerboard_csv = output_folder / "checkerboard_calibration.csv"
+    checkerboard_records = pd.read_csv(checkerboard_csv)
+    checkerboard_records["ruler_scale_correction_factor"] = correction
+    checkerboard_records["corrected_pixels_per_mm"] = (
+        checkerboard_records["pixels_per_mm"] / correction
+    )
+    checkerboard_records["corrected_mm_per_pixel"] = (
+        checkerboard_records["mm_per_pixel"] * correction
+    )
+    checkerboard_records.to_csv(checkerboard_csv, index=False)
+    return result
 
 
 def find_green_marker(
@@ -922,9 +1096,37 @@ def main() -> None:
         output_folder,
     )
     print(
-        f"Scale: {plane.pixels_per_mm:.5f} px/mm "
+        f"Checkerboard-only scale: {plane.pixels_per_mm:.5f} px/mm "
         f"({plane.mm_per_pixel:.5f} mm/px)"
     )
+    ruler_result: dict[str, float] | None = None
+    if not arguments.skip_ruler:
+        print(
+            "Click two ruler marks exactly "
+            f"{RULER_REFERENCE_LENGTH_MM:.0f} mm apart, then press Enter..."
+        )
+        ruler_result = apply_ruler_scale_correction(
+            capture,
+            plane,
+            camera_matrix,
+            distortion,
+            new_camera_matrix,
+            output_folder,
+        )
+        print(
+            "Checkerboard measured the clicked ruler span as "
+            f"{ruler_result['checkerboard_measured_ruler_length_before_correction_mm']:.3f} mm"
+        )
+        print(
+            f"Applied ruler scale correction x "
+            f"{ruler_result['ruler_scale_correction_factor']:.6f}"
+        )
+        print(
+            f"Corrected scale: {plane.pixels_per_mm:.5f} px/mm "
+            f"({plane.mm_per_pixel:.5f} mm/px)"
+        )
+    else:
+        print("Ruler correction skipped; using the checkerboard-only scale.")
     print(f"Tracking the green dot from {TRACKING_START_S:.1f} s...")
     raw = track_video(
         capture,
@@ -940,6 +1142,15 @@ def main() -> None:
     capture.release()
     raw.to_csv(output_folder / "green_dot_raw_tracking.csv", index=False)
     valid, summary = compare_with_theory(raw, gait, output_folder)
+    summary["ruler_scale_correction_applied"] = ruler_result is not None
+    summary["ruler_reference_length_mm"] = RULER_REFERENCE_LENGTH_MM
+    summary["ruler_scale_correction_factor"] = (
+        ruler_result["ruler_scale_correction_factor"]
+        if ruler_result is not None else 1.0
+    )
+    summary["final_pixels_per_mm"] = plane.pixels_per_mm
+    summary["final_mm_per_pixel"] = plane.mm_per_pixel
+    summary.to_csv(output_folder / "tracking_summary.csv", index=False)
 
     print(
         f"Valid detections: {int(summary.loc[0, 'detected_tracking_frames'])}"

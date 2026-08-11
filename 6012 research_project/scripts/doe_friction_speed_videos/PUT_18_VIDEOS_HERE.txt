@@ -1,0 +1,10 @@
+Place the 18 friction-versus-cycle-duration recordings in this folder.
+
+Recommended filename format:
+run01_high_cycle1p5s_rep2.mp4
+
+Use "high" or "low", cycle durations "1p5s", "3s" or "6s", and repeats
+"rep1", "rep2" or "rep3". The first number is the randomised recording order.
+
+The script creates experiment_manifest.csv. If your existing filenames use a
+different format, run once, fill the missing manifest fields, and run again.

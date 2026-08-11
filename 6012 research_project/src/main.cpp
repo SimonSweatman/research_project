@@ -19,6 +19,8 @@ ServoDriver board2;
 constexpr uint8_t BOARD1_ADDR = 0x7E;
 constexpr uint8_t BOARD2_ADDR = 0x7F;
 constexpr uint8_t CILIA_COUNT = 12;
+constexpr uint8_t SYNC_LED_PIN = 7;
+constexpr uint32_t SYNC_LED_PULSE_MS = 150;
 
 struct CiliumChannels
 {
@@ -107,6 +109,9 @@ bool pausedFromRunning = false;
 uint32_t lastMotionUpdateMs = 0;
 uint32_t transitionStartMs = 0;
 
+bool syncLedOn = false;
+uint32_t syncLedOffMs = 0;
+
 uint16_t currentLowerPwm[CILIA_COUNT];
 uint16_t currentUpperPwm[CILIA_COUNT];
 uint16_t transitionStartLower[CILIA_COUNT];
@@ -122,6 +127,30 @@ constexpr uint8_t SERIAL_BUFFER_SIZE = 48;
 char serialBuffer[SERIAL_BUFFER_SIZE];
 uint8_t serialLength = 0;
 bool serialOverflow = false;
+
+// ============================================================
+// VIDEO SYNCHRONISATION LED
+// ============================================================
+
+void triggerSyncLed(uint32_t now)
+{
+    digitalWrite(SYNC_LED_PIN, HIGH);
+    syncLedOn = true;
+    syncLedOffMs = now + SYNC_LED_PULSE_MS;
+}
+
+void updateSyncLed(uint32_t now)
+{
+    // Signed subtraction keeps the comparison safe across millis() overflow.
+    if (
+        syncLedOn
+        && static_cast<int32_t>(now - syncLedOffMs) >= 0
+    )
+    {
+        digitalWrite(SYNC_LED_PIN, LOW);
+        syncLedOn = false;
+    }
+}
 
 // ============================================================
 // PWM AND GAIT HELPERS
@@ -296,6 +325,7 @@ void updateTransition(uint32_t now)
     {
         runState = RunState::RUNNING;
         lastMotionUpdateMs = now;
+        triggerSyncLed(now);
         Serial.println(F("RUNNING"));
     }
     else
@@ -310,10 +340,15 @@ void updateRunningMotion(uint32_t now)
 {
     const uint32_t elapsed = now - lastMotionUpdateMs;
     lastMotionUpdateMs = now;
+    const float previousPhase = globalPhase;
     globalPhase = wrapPhase(
         globalPhase
         + static_cast<float>(elapsed) / static_cast<float>(cycleDurationMs)
     );
+    if (globalPhase < previousPhase)
+    {
+        triggerSyncLed(now);
+    }
     commandArrayAtPhase(globalPhase);
 }
 
@@ -559,6 +594,9 @@ void setup()
     Serial.begin(115200);
     Wire.begin();
 
+    pinMode(SYNC_LED_PIN, OUTPUT);
+    digitalWrite(SYNC_LED_PIN, LOW);
+
     board1.init(BOARD1_ADDR);
     board2.init(BOARD2_ADDR);
     board1.setServoPulseRange(500, 2500, 180);
@@ -581,6 +619,7 @@ void loop()
     readSerialCommands();
 
     const uint32_t now = millis();
+    updateSyncLed(now);
     if (now - lastMotionUpdateMs < SERVO_UPDATE_MS)
     {
         return;

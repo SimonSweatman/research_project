@@ -1,0 +1,8 @@
+Place the 21 phase-test recordings in this folder.
+
+Recommended filename format:
+run01_phase270_rep2.mp4
+
+The first number is the actual randomised recording order. The script creates
+experiment_manifest.csv from these filenames so the design can be audited and
+corrected without renaming videos.
